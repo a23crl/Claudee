@@ -1,0 +1,208 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0.
+//
+// VWAP Pullback (Intraday) — TradingView port of vwap_pullback/strategy.py +
+// backtest.py from this repo. Same edge, same state machine, same risk
+// model; see the top-level README for the strategy write-up and the
+// checklist to run before trusting this with real money.
+//
+// Not proven profitable. This is a starting point for your own testing in
+// the Strategy Tester (In-sample/out-of-sample split, multiple symbols,
+// realistic commission/slippage in Properties) — not a signal to trade as-is.
+//@version=5
+strategy(
+     "VWAP Pullback (Intraday)",
+     shorttitle    = "VWAP-PB",
+     overlay       = true,
+     initial_capital     = 100000,
+     currency             = currency.USD,
+     default_qty_type     = strategy.cash,
+     default_qty_value    = 100000,
+     commission_type       = strategy.commission.percent,
+     commission_value       = 0.01,   // ~1 bps round-turn approximation; set your real costs in Properties
+     slippage               = 2,       // in ticks; adjust for your instrument in Properties
+     pyramiding             = 0,
+     calc_on_every_tick     = false)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+atrPeriod           = input.int(14, "ATR period", minval = 1, group = "VWAP / ATR")
+minExtensionAtr      = input.float(1.0, "Min extension from VWAP (ATR)", minval = 0.01, step = 0.05, group = "Entry Rules", tooltip = "How far price must extend from session VWAP, in ATR units, to establish a directional bias.")
+minTrendBars          = input.int(3, "Min bars bias must hold", minval = 1, group = "Entry Rules")
+pullbackAtrMult       = input.float(0.35, "Pullback zone (ATR)", minval = 0.01, step = 0.05, group = "Entry Rules", tooltip = "\"Close enough to VWAP\" zone, in ATR units, that defines a valid pullback.")
+requireMomentumBreak  = input.bool(true, "Require momentum break of prior bar", group = "Entry Rules")
+stopLookback           = input.int(5, "Stop swing lookback (bars)", minval = 1, group = "Risk Management")
+stopBufferAtr           = input.float(0.1, "Stop buffer (ATR)", minval = 0.0, step = 0.05, group = "Risk Management")
+rewardR                 = input.float(2.0, "Take-profit (R multiple)", minval = 0.1, step = 0.1, group = "Risk Management")
+riskPct                 = input.float(0.75, "Risk per trade (% of equity)", minval = 0.01, step = 0.05, group = "Risk Management") / 100.0
+maxGrossExposurePct     = input.float(100.0, "Max notional exposure (% of equity)", minval = 1.0, step = 5.0, group = "Risk Management") / 100.0
+allowShort               = input.bool(true, "Allow short trades", group = "Entry Rules")
+useDateFilter            = input.bool(false, "Limit to date range", group = "Session & Filters")
+startDate                = input.time(timestamp(2023, 1, 1, 0, 0), "Start", group = "Session & Filters")
+endDate                  = input.time(timestamp(2025, 1, 1, 0, 0), "End", group = "Session & Filters")
+
+minAtrValue = 1e-6
+
+// ---------------------------------------------------------------------------
+// Session VWAP (resets every session, mirrors vwap_pullback/indicators.py::session_vwap)
+// ---------------------------------------------------------------------------
+newSession = session.isfirstbar
+
+var float cumPV  = na
+var float cumVol = na
+if newSession
+    cumPV  := 0.0
+    cumVol := 0.0
+cumPV  += hlc3 * volume
+cumVol += volume
+vwapVal = cumVol > 0 ? cumPV / cumVol : na
+
+atrRaw  = ta.atr(atrPeriod)
+atrVal  = math.max(atrRaw, minAtrValue)
+distAtr = (close - vwapVal) / atrVal
+
+inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// ---------------------------------------------------------------------------
+// Bias / pullback / trigger state machine (mirrors vwap_pullback/strategy.py::generate_signals)
+// ---------------------------------------------------------------------------
+var int   bias          = 0     // 0 = none, 1 = up, -1 = down
+var int   biasBarCount  = 0
+var bool  extensionSeen = false
+
+if newSession
+    bias          := 0
+    biasBarCount  := 0
+    extensionSeen := false
+
+bool  longSignal = false
+bool  shortSignal = false
+float stopCalc    = na
+
+if not na(distAtr)
+    if bias == 0
+        if distAtr >= minExtensionAtr
+            bias          := 1
+            extensionSeen := true
+            biasBarCount  := 1
+        else if distAtr <= -minExtensionAtr
+            bias          := -1
+            extensionSeen := true
+            biasBarCount  := 1
+    else
+        bool flipped = false
+        if bias == 1 and distAtr <= -minExtensionAtr
+            bias          := -1
+            extensionSeen := true
+            biasBarCount  := 1
+            flipped       := true
+        else if bias == -1 and distAtr >= minExtensionAtr
+            bias          := 1
+            extensionSeen := true
+            biasBarCount  := 1
+            flipped       := true
+
+        if not flipped
+            biasBarCount += 1
+            if bias == 1 and distAtr >= minExtensionAtr
+                extensionSeen := true
+            else if bias == -1 and distAtr <= -minExtensionAtr
+                extensionSeen := true
+
+            bool armed = extensionSeen and biasBarCount >= minTrendBars and math.abs(distAtr) <= pullbackAtrMult
+            if armed and bias == 1
+                bool bullishBar = close > open
+                bool reclaimed  = close > vwapVal
+                bool momentumOk = requireMomentumBreak ? (close > high[1]) : true
+                if bullishBar and reclaimed and momentumOk
+                    float swingLow = ta.lowest(low, stopLookback)
+                    longSignal    := true
+                    stopCalc      := swingLow - stopBufferAtr * atrVal
+                    extensionSeen := false
+            if armed and bias == -1
+                bool bearishBar = close < open
+                bool reclaimed2 = close < vwapVal
+                bool momentumOk2 = requireMomentumBreak ? (close < low[1]) : true
+                if bearishBar and reclaimed2 and momentumOk2
+                    float swingHigh = ta.highest(high, stopLookback)
+                    shortSignal   := true
+                    stopCalc      := swingHigh + stopBufferAtr * atrVal
+                    extensionSeen := false
+
+// ---------------------------------------------------------------------------
+// Entries — a signal on this bar's close fills at the NEXT bar's open, same
+// as the Python backtester (that's Pine's default market-order timing, no
+// extra code needed). Position size targets riskPct of equity lost at the
+// stop, capped by maxGrossExposurePct of notional; sized off this bar's
+// close as a lookahead-free proxy for the (unknown) next-bar fill price.
+// ---------------------------------------------------------------------------
+var float pendingStop = na
+
+canEnter = strategy.position_size == 0 and not session.islastbar and inDateRange
+
+if longSignal and canEnter
+    riskPerShare = close - stopCalc
+    if riskPerShare > 0
+        qty = math.floor(math.min(riskPct * strategy.equity / riskPerShare, maxGrossExposurePct * strategy.equity / close))
+        if qty > 0
+            pendingStop := stopCalc
+            strategy.entry("Long", strategy.long, qty = qty)
+
+if shortSignal and canEnter and allowShort
+    riskPerShareS = stopCalc - close
+    if riskPerShareS > 0
+        qtyS = math.floor(math.min(riskPct * strategy.equity / riskPerShareS, maxGrossExposurePct * strategy.equity / close))
+        if qtyS > 0
+            pendingStop := stopCalc
+            strategy.entry("Short", strategy.short, qty = qtyS)
+
+// ---------------------------------------------------------------------------
+// Exits — fixed stop (pullback swing +/- ATR buffer) and fixed target
+// (rewardR multiples of initial risk), set once on fill and held for the
+// life of the trade (no trailing), plus a forced flatten at session end.
+// ---------------------------------------------------------------------------
+var float activeStop   = na
+var float activeTarget = na
+
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justFilled
+    entryPx      = strategy.position_avg_price
+    activeStop   := pendingStop
+    riskAmount   = math.abs(entryPx - activeStop)
+    activeTarget := strategy.position_size > 0 ? entryPx + rewardR * riskAmount : entryPx - rewardR * riskAmount
+
+if session.islastbar and strategy.position_size != 0
+    strategy.close_all(comment = "session_end")
+    activeStop   := na
+    activeTarget := na
+else
+    if strategy.position_size > 0
+        strategy.exit("Exit Long", from_entry = "Long", stop = activeStop, limit = activeTarget)
+    if strategy.position_size < 0
+        strategy.exit("Exit Short", from_entry = "Short", stop = activeStop, limit = activeTarget)
+
+if strategy.position_size == 0
+    activeStop   := na
+    activeTarget := na
+    pendingStop  := na
+
+// ---------------------------------------------------------------------------
+// Visuals
+// ---------------------------------------------------------------------------
+plot(vwapVal, title = "Session VWAP", color = color.new(color.blue, 0), linewidth = 2)
+bgcolor(bias == 1 ? color.new(color.green, 92) : bias == -1 ? color.new(color.red, 92) : na, title = "Bias")
+
+plotshape(longSignal, title = "Long Signal", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny)
+plotshape(shortSignal, title = "Short Signal", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny)
+
+plot(strategy.position_size != 0 ? activeStop : na, title = "Stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size != 0 ? activeTarget : na, title = "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ---------------------------------------------------------------------------
+// Alerts — for paper/live use via TradingView alerts -> webhook to your own
+// execution bridge or supported broker integration. TradingView itself does
+// not place trades from a Pine strategy; the Strategy Tester is simulation
+// only. See tradingview/README.md.
+// ---------------------------------------------------------------------------
+alertcondition(longSignal, title = "VWAP Pullback Long", message = "VWAP Pullback LONG: {{ticker}} @ {{close}}")
+alertcondition(shortSignal, title = "VWAP Pullback Short", message = "VWAP Pullback SHORT: {{ticker}} @ {{close}}")

@@ -138,6 +138,15 @@ If it fails any of these, the honest conclusion is "not yet" — the code
 here is meant to help you find that out cheaply, before finding it out with
 real money.
 
+## Running it on TradingView
+
+`tradingview/vwap_pullback_strategy.pine` is a Pine Script v5 port of the
+same strategy (same VWAP/ATR bias-pullback-trigger state machine, same
+fixed-stop/R-multiple-target risk model, same session flatten), for use in
+TradingView's Strategy Tester or as a live-alert source. See
+`tradingview/README.md` for setup and — importantly — how its execution
+model differs from the Python backtester above.
+
 ## Project layout
 
 ```
@@ -152,4 +161,5 @@ vwap_pullback/
 run_backtest.py  # CLI: run one backtest end-to-end
 sweep.py         # CLI: parameter sensitivity grid search
 tests/           # pytest unit tests
+tradingview/     # Pine Script v5 port for TradingView's Strategy Tester / alerts
 ```
