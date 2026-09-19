@@ -32,7 +32,12 @@ strategy(
      default_qty_type     = strategy.cash,
      default_qty_value    = 100000,
      commission_type       = strategy.commission.percent,
-     commission_value       = 0.01,   // ~1 bps round-turn approximation; set your real costs in Properties
+     commission_value       = 0.01,   // ~1 bps round-turn approximation; set your real costs in Properties.
+                                       // For FUTURES, percent-of-notional is the wrong model -- your broker
+                                       // charges a flat $ per contract per side. Switch commission_type to
+                                       // strategy.commission.cash_per_contract and commission_value to that
+                                       // $ amount in Properties -> Commission (or here), e.g. ~$0.85-$2.25/side
+                                       // round-turn for MNQ depending on broker.
      slippage               = 2,       // in ticks; adjust for your instrument in Properties
      pyramiding             = 0,
      calc_on_every_tick     = false)
@@ -157,10 +162,16 @@ var float pendingStop = na
 
 canEnter = strategy.position_size == 0 and not session.islastbar and inDateRange
 
+// syminfo.pointvalue converts a price-point move into dollars per contract.
+// It's 1 for stocks/ETFs (1 point == $1), but e.g. 2 for Micro E-mini
+// Nasdaq (MNQ) and 5 for Micro E-mini S&P (MES) -- skipping it would size
+// futures positions at the wrong multiple of the intended risk.
 if longSignal and canEnter
     riskPerShare = close - stopCalc
     if riskPerShare > 0
-        qty = math.floor(math.min(riskPct * strategy.equity / riskPerShare, maxGrossExposurePct * strategy.equity / close))
+        dollarRiskPerContract = riskPerShare * syminfo.pointvalue
+        notionalPerContract = close * syminfo.pointvalue
+        qty = math.floor(math.min(riskPct * strategy.equity / dollarRiskPerContract, maxGrossExposurePct * strategy.equity / notionalPerContract))
         if qty > 0
             pendingStop := stopCalc
             strategy.entry("Long", strategy.long, qty = qty)
@@ -168,7 +179,9 @@ if longSignal and canEnter
 if shortSignal and canEnter and allowShort
     riskPerShareS = stopCalc - close
     if riskPerShareS > 0
-        qtyS = math.floor(math.min(riskPct * strategy.equity / riskPerShareS, maxGrossExposurePct * strategy.equity / close))
+        dollarRiskPerContractS = riskPerShareS * syminfo.pointvalue
+        notionalPerContractS = close * syminfo.pointvalue
+        qtyS = math.floor(math.min(riskPct * strategy.equity / dollarRiskPerContractS, maxGrossExposurePct * strategy.equity / notionalPerContractS))
         if qtyS > 0
             pendingStop := stopCalc
             strategy.entry("Short", strategy.short, qty = qtyS)
