@@ -154,6 +154,14 @@ fixed-point stop/target) for the 5-minute chart — it isn't tied to the
 Python research code above. See `tradingview/README.md` for its rules and
 setup.
 
+## Running it on QuantConnect
+
+`quantconnect/nq_vwap_momentum_algorithm.py` is a QuantConnect (LEAN)
+Python port of that same NQ strategy, for backtesting in QuantConnect's
+cloud IDE or local LEAN CLI instead of TradingView's Strategy Tester. See
+`quantconnect/README.md` for the rule-by-rule mapping from Pine to Python
+and the setup/limitations notes.
+
 ## Project layout
 
 ```
