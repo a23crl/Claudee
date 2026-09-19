@@ -8,6 +8,20 @@
 // Not proven profitable. This is a starting point for your own testing in
 // the Strategy Tester (In-sample/out-of-sample split, multiple symbols,
 // realistic commission/slippage in Properties) — not a signal to trade as-is.
+//
+// TradingView plan bar limit: lower tiers cap total historical bars a chart
+// can load (as low as 10,000). That cap is on BAR COUNT, not calendar time,
+// so it bites hardest on small timeframes:
+//   1m  @ 10,000 bars ~= 25 trading days   (~1 month)  -- too small a sample
+//   5m  @ 10,000 bars ~= 128 trading days  (~6 months)
+//   15m @ 10,000 bars ~= 385 trading days  (~1.5 years)
+//   30m @ 10,000 bars ~= 770 trading days  (~3 years)
+// The table drawn in the chart's top-right corner reports the actual bar
+// count and date range you got, so you don't have to guess — if it's short,
+// prefer a higher timeframe over a lower one to get a large enough sample
+// (see the top-level README's "Deciding if it's worth going live", point 5).
+// useDateFilter/startDate/endDate only trim what TradingView already
+// loaded; they cannot pull in bars beyond your plan's cap.
 //@version=5
 strategy(
      "VWAP Pullback (Intraday)",
@@ -38,8 +52,11 @@ riskPct                 = input.float(0.75, "Risk per trade (% of equity)", minv
 maxGrossExposurePct     = input.float(100.0, "Max notional exposure (% of equity)", minval = 1.0, step = 5.0, group = "Risk Management") / 100.0
 allowShort               = input.bool(true, "Allow short trades", group = "Entry Rules")
 useDateFilter            = input.bool(false, "Limit to date range", group = "Session & Filters")
-startDate                = input.time(timestamp(2023, 1, 1, 0, 0), "Start", group = "Session & Filters")
-endDate                  = input.time(timestamp(2025, 1, 1, 0, 0), "End", group = "Session & Filters")
+// NOTE: the multi-arg timestamp(year, month, day, ...) form resolves to
+// "simple int" and input.time() requires a "const int" default -- use the
+// single-string form of timestamp(), which Pine folds to a true constant.
+startDate                = input.time(timestamp("2023-01-01T00:00:00"), "Start", group = "Session & Filters")
+endDate                  = input.time(timestamp("2025-01-01T00:00:00"), "End", group = "Session & Filters")
 
 minAtrValue = 1e-6
 
@@ -185,6 +202,24 @@ if strategy.position_size == 0
     activeStop   := na
     activeTarget := na
     pendingStop  := na
+
+// ---------------------------------------------------------------------------
+// Data-coverage diagnostic — reports how many bars/how much calendar time
+// TradingView actually loaded on this chart/timeframe, since lower plan
+// tiers cap total historical bars (see the note at the top of this file).
+// ---------------------------------------------------------------------------
+var int firstBarTime = na
+if bar_index == 0
+    firstBarTime := time
+
+var table infoTable = table.new(position.top_right, 2, 3, border_width = 1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Bars on chart", bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 1, 0, str.tostring(bar_index + 1), bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Chart range", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 1, str.format_time(firstBarTime, "yyyy-MM-dd") + " to " + str.format_time(time, "yyyy-MM-dd"), bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 0, 2, "Closed trades", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 2, str.tostring(strategy.closedtrades), bgcolor = color.new(color.gray, 70), text_color = color.white)
 
 // ---------------------------------------------------------------------------
 // Visuals

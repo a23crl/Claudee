@@ -9,16 +9,6 @@ sensitivity sweep.
 real orders. It exists to help you decide *whether* implementing this
 strategy live is worth doing.
 
-A TradingView port (`pinescript/vwap_pullback.pine`) mirrors the same logic
-as a `strategy()` script, for backtesting directly against TradingView's own
-data. Its comments cover a subtlety worth knowing up front: **TradingView
-plans cap total historical bars** (commonly 5,000-10,000 on lower tiers),
-which limits calendar coverage hardest on small timeframes (10,000 bars is
-~1 month on a 1-minute chart but ~1.5 years on a 15-minute chart). The
-script draws a small table on the chart reporting the actual bar count and
-date range you got, so you can judge whether the sample is even large
-enough to trust (see point 5 below).
-
 ## The strategy
 
 Intraday, trend-following, mean-reversion-to-VWAP:

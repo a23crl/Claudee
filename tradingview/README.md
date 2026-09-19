@@ -8,6 +8,18 @@ importantly, the checklist for deciding whether any backtest result is
 strong enough to trust with real money. Nothing here is proven profitable —
 treat it as a starting point for your own testing, not a signal to trade.
 
+## Plan bar limits
+
+Lower TradingView plan tiers cap total historical bars a chart can load
+(as low as 10,000). That cap is on bar count, not calendar time, so it's
+much more restrictive on small timeframes: 10,000 bars is only ~1 month
+of history on a 1-minute chart, but ~6 months on 5-minute and ~1.5 years
+on 15-minute. The script draws a small table in the chart's top-right
+corner showing the actual bar count and date range you got — check it
+before trusting a backtest's metrics, and prefer a higher timeframe if the
+sample looks too small (see the top-level README, "Deciding if it's worth
+going live", point 5, on trade-count reliability).
+
 ## Setup
 
 1. Open a TradingView chart on an **intraday interval** (1m–15m; the
