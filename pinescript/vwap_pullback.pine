@@ -1,0 +1,207 @@
+//@version=6
+// VWAP Pullback — TradingView port of vwap_pullback/strategy.py + backtest.py
+//
+// Same logic as the Python research project in this repo:
+//   1. Price extends >= minExtensionAtr (ATR units) away from session VWAP -> bias.
+//   2. Bias must hold for >= minTrendBars bars.
+//   3. Price pulls back to within pullbackAtrMult ATR of VWAP.
+//   4. Trigger bar: closes back on the biased side of VWAP, in-trend body,
+//      optionally breaks the prior bar's high/low -> enter.
+//   5. Stop at the pullback swing low/high (+ ATR buffer), target at
+//      rewardR * initial risk, forced flat at the session's last bar.
+//
+// IMPORTANT — TradingView plan bar limits:
+// Free/lower-tier plans cap how many historical bars a chart can load
+// (commonly 5,000-10,000, vs 20,000+/40,000+ on higher tiers). That cap is
+// on TOTAL BARS, not calendar time, so it bites hardest on small
+// timeframes:
+//   1m  chart, 10,000 bars ~= 25 trading days   (~1 month)  -- too small a sample
+//   5m  chart, 10,000 bars ~= 128 trading days  (~6 months)
+//   15m chart, 10,000 bars ~= 385 trading days  (~1.5 years)
+//   30m chart, 10,000 bars ~= 770 trading days  (~3 years)
+//   1h  chart, 10,000 bars ~= 1538 trading days (~6 years)
+// The table drawn in the top-right corner reports the ACTUAL bar count and
+// date range TradingView gave you on the current chart/timeframe, so you
+// don't have to guess. If it's short, favor a higher timeframe (15m/30m)
+// over a lower one to get a sample size large enough to trust the metrics
+// (see the Python project's README, point 5, on trade-count reliability).
+// `useDateFilter`/`startDate` only trims from what TradingView already
+// loaded -- it cannot pull in bars beyond your plan's cap.
+
+strategy(
+     "VWAP Pullback",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.01,   // 1 bps per side, matches commission_bps=1.0 in the Python backtester
+     slippage = 1,              // in ticks -- Pine has no native bps-of-price slippage model
+     process_orders_on_close = false) // signal on bar close -> fill on next bar open, matching backtest.py
+
+// ---------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------
+atrPeriod            = input.int(14, "ATR period", minval = 1, group = "Signal")
+minExtensionAtr       = input.float(1.0, "Min extension from VWAP (ATR)", minval = 0.0, group = "Signal")
+minTrendBars          = input.int(3, "Min bars bias must hold", minval = 1, group = "Signal")
+pullbackAtrMult       = input.float(0.35, "Pullback zone (ATR)", minval = 0.0, group = "Signal")
+requireMomentumBreak  = input.bool(true, "Require momentum break of prior bar", group = "Signal")
+stopLookback          = input.int(5, "Stop swing lookback (bars)", minval = 1, group = "Risk")
+stopBufferAtr         = input.float(0.1, "Stop buffer (ATR)", group = "Risk")
+rewardR               = input.float(2.0, "Take-profit (R multiple)", minval = 0.0, group = "Risk")
+riskPct               = input.float(0.75, "Risk per trade (% of equity)", minval = 0.0, group = "Risk")
+maxGrossExposurePct   = input.float(100.0, "Max notional exposure (% of equity)", minval = 0.0, group = "Risk")
+allowShort            = input.bool(true, "Allow short trades", group = "Risk")
+useDateFilter         = input.bool(false, "Limit to date range", group = "Date range")
+startDate             = input.time(timestamp("2023-01-01T00:00:00"), "Start date", group = "Date range")
+minAtrValue           = 1e-6
+
+// ---------------------------------------------------------------------
+// Session VWAP (resets every session, mirrors vwap_pullback/indicators.py)
+// ---------------------------------------------------------------------
+newSession = session.isfirstbar
+
+var float cumPV = na
+var float cumVol = na
+if newSession
+    cumPV := 0.0
+    cumVol := 0.0
+cumPV += hlc3 * volume
+cumVol += volume
+vwapVal = cumVol > 0 ? cumPV / cumVol : na
+
+atrVal = math.max(ta.atr(atrPeriod), minAtrValue)
+distAtr = na(vwapVal) ? na : (close - vwapVal) / atrVal
+
+// ---------------------------------------------------------------------
+// Bias / extension / pullback state machine (mirrors strategy.py's loop)
+// ---------------------------------------------------------------------
+var string bias = na
+var int biasBarCount = 0
+var bool extensionSeen = false
+
+if newSession
+    bias := na
+    biasBarCount := 0
+    extensionSeen := false
+
+if not na(distAtr)
+    if na(bias)
+        if distAtr >= minExtensionAtr
+            bias := "up"
+            extensionSeen := true
+            biasBarCount := 1
+        else if distAtr <= -minExtensionAtr
+            bias := "down"
+            extensionSeen := true
+            biasBarCount := 1
+    else if bias == "up" and distAtr <= -minExtensionAtr
+        bias := "down"
+        extensionSeen := true
+        biasBarCount := 1
+    else if bias == "down" and distAtr >= minExtensionAtr
+        bias := "up"
+        extensionSeen := true
+        biasBarCount := 1
+    else
+        biasBarCount += 1
+        if bias == "up" and distAtr >= minExtensionAtr
+            extensionSeen := true
+        if bias == "down" and distAtr <= -minExtensionAtr
+            extensionSeen := true
+
+armed = extensionSeen and biasBarCount >= minTrendBars and not na(distAtr) and math.abs(distAtr) <= pullbackAtrMult
+
+longSignal = false
+shortSignal = false
+float stopPriceCalc = na
+
+if armed and bias == "up"
+    bullishBar = close > open
+    reclaimed = close > vwapVal
+    momentumOk = requireMomentumBreak ? close > high[1] : true
+    if bullishBar and reclaimed and momentumOk
+        longSignal := true
+        swingLow = ta.lowest(low, stopLookback)
+        stopPriceCalc := swingLow - stopBufferAtr * atrVal
+        extensionSeen := false
+
+if armed and bias == "down"
+    bearishBar = close < open
+    reclaimed = close < vwapVal
+    momentumOk = requireMomentumBreak ? close < low[1] : true
+    if bearishBar and reclaimed and momentumOk
+        shortSignal := true
+        swingHigh = ta.highest(high, stopLookback)
+        stopPriceCalc := swingHigh + stopBufferAtr * atrVal
+        extensionSeen := false
+
+// ---------------------------------------------------------------------
+// Entries / exits
+// ---------------------------------------------------------------------
+// NOTE: qty and the target level are sized off THIS bar's close as a proxy
+// for the entry fill (the real fill is next bar's open, which isn't known
+// yet when the order is placed) -- a standard Pine Script approximation.
+// The stop and target price LEVELS themselves are exact once set.
+dateOk = not useDateFilter or time >= startDate
+flat = strategy.position_size == 0
+canEnter = dateOk and flat and not session.islastbar
+
+if longSignal and canEnter
+    riskPerShare = math.abs(close - stopPriceCalc)
+    if riskPerShare > 0
+        dollarRisk = strategy.equity * riskPct / 100.0
+        qtyByRisk = dollarRisk / riskPerShare
+        maxNotional = strategy.equity * maxGrossExposurePct / 100.0
+        qtyByExposure = maxNotional / close
+        qty = math.floor(math.min(qtyByRisk, qtyByExposure))
+        if qty > 0
+            targetPrice = close + rewardR * riskPerShare
+            strategy.entry("Long", strategy.long, qty = qty)
+            strategy.exit("Exit Long", from_entry = "Long", stop = stopPriceCalc, limit = targetPrice)
+
+if shortSignal and allowShort and canEnter
+    riskPerShare = math.abs(close - stopPriceCalc)
+    if riskPerShare > 0
+        dollarRisk = strategy.equity * riskPct / 100.0
+        qtyByRisk = dollarRisk / riskPerShare
+        maxNotional = strategy.equity * maxGrossExposurePct / 100.0
+        qtyByExposure = maxNotional / close
+        qty = math.floor(math.min(qtyByRisk, qtyByExposure))
+        if qty > 0
+            targetPrice = close - rewardR * riskPerShare
+            strategy.entry("Short", strategy.short, qty = qty)
+            strategy.exit("Exit Short", from_entry = "Short", stop = stopPriceCalc, limit = targetPrice)
+
+// Forced flat at the last bar of the session -- VWAP resets daily and no
+// overnight risk is modeled, matching backtest.py.
+if session.islastbar and strategy.position_size != 0
+    strategy.close_all(comment = "session_end")
+
+// ---------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------
+plot(vwapVal, "VWAP", color = color.new(color.purple, 0), linewidth = 2)
+plotshape(longSignal, title = "Long signal", style = shape.triangleup, location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny)
+plotshape(shortSignal, title = "Short signal", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0), size = size.tiny)
+
+// ---------------------------------------------------------------------
+// Data-coverage diagnostic (see the bar-limit note at the top of this file)
+// ---------------------------------------------------------------------
+var int firstBarTime = na
+if bar_index == 0
+    firstBarTime := time
+
+var table infoTable = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Bars on chart", bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 1, 0, str.tostring(bar_index + 1), bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Chart start", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 1, str.format_time(firstBarTime, "yyyy-MM-dd"), bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 0, 2, "Chart end", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 2, str.format_time(time, "yyyy-MM-dd"), bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 0, 3, "Closed trades", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 3, str.tostring(strategy.closedtrades), bgcolor = color.new(color.gray, 70), text_color = color.white)
