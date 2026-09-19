@@ -147,6 +147,13 @@ TradingView's Strategy Tester or as a live-alert source. See
 `tradingview/README.md` for setup and — importantly — how its execution
 model differs from the Python backtester above.
 
+The `tradingview/` folder also has `nq_vwap_momentum_strategy.pine`, a
+separate, independently-specified NQ futures strategy (VWAP slope + 1-hour
+momentum bias, pullback-candle trigger, fixed session/trade/loss limits,
+fixed-point stop/target) for the 5-minute chart — it isn't tied to the
+Python research code above. See `tradingview/README.md` for its rules and
+setup.
+
 ## Project layout
 
 ```
