@@ -489,6 +489,9 @@ if showTable and barstate.islast
     if insufficientHistory
         f_cell(statsTable, 0, 0, "ORB Long r1+RVOL")
         f_cell(statsTable, 1, 0, "INSUFFICIENT HISTORY")
+        f_cell(statsTable, 2, 0, "Chart data starts: " + f_datetimeStr(chartFirstBarTime))
+        f_cell(statsTable, 3, 0, "Design End Date needs to be after that")
+        f_cell(statsTable, 4, 0, "Sessions seen so far: " + str.tostring(sessionIdx))
     else
         [dTr, dWR, dAvgR, dPay, dPF, dStk, dDD, dTk, dSk] = f_sampleStats(0)
         [vTr, vWR, vAvgR, vPay, vPF, vStk, vDD, vTk, vSk] = f_sampleStats(1)
