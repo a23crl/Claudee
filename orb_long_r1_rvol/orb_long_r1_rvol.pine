@@ -360,7 +360,7 @@ if state == 1 and not sig
 // ---------------------------------------------------------------------------
 // 5.6 / 9 Statistics engine — recomputed fully at the last bar
 // ---------------------------------------------------------------------------
-var float chartFirstBarTime = na
+var int chartFirstBarTime = na
 if barstate.isfirst
     chartFirstBarTime := time
 insufficientHistory = chartFirstBarTime > designEndInput
