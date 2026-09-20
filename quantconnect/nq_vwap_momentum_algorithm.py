@@ -144,6 +144,12 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.entry_price = None
         self.entry_direction = 0
         self.exit_tickets = []         # stop + target (or the EOD liquidate ticket)
+        # The actual tradable contract (self._symbol is the canonical
+        # continuous future used for data/consolidation; orders must go on
+        # the currently-mapped underlying contract instead). Captured once
+        # at entry time and reused for that trade's stop/target/liquidate
+        # so it can't drift if a roll happens to change the mapping mid-trade.
+        self.active_contract_symbol = None
 
         # ------------------------------------------------------------------
         # Daily trade/loss counters.
@@ -199,8 +205,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
                 ticket.cancel()
         self.exit_tickets = []
 
-        if self.portfolio[self._symbol].invested:
-            liquidate_tickets = self.liquidate(self._symbol, "eod_flatten")
+        if self.active_contract_symbol is not None and self.portfolio[self.active_contract_symbol].invested:
+            liquidate_tickets = self.liquidate(self.active_contract_symbol, "eod_flatten")
             # Route the liquidation fill through the same exit-fill handling
             # (pnl / loss-count bookkeeping, state reset) as a stop/target.
             self.exit_tickets = list(liquidate_tickets)
@@ -327,8 +333,11 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
     # Order management
     # ----------------------------------------------------------------------
     def _submit_entry(self, direction: int):
+        # The canonical continuous symbol (self._symbol) is not itself
+        # tradable -- only the currently-mapped underlying contract is.
+        self.active_contract_symbol = self.securities[self._symbol].mapped
         quantity = direction * self.order_size
-        self.entry_ticket = self.market_order(self._symbol, quantity)
+        self.entry_ticket = self.market_order(self.active_contract_symbol, quantity)
         self.pending_direction = direction
         self.in_position = True
         self.trades_today += 1
@@ -358,8 +367,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             stop_price = self.entry_price + self.short_stop_points
             target_price = self.entry_price - self.short_target_points
 
-        stop_ticket = self.stop_market_order(self._symbol, exit_quantity, stop_price)
-        target_ticket = self.limit_order(self._symbol, exit_quantity, target_price)
+        stop_ticket = self.stop_market_order(self.active_contract_symbol, exit_quantity, stop_price)
+        target_ticket = self.limit_order(self.active_contract_symbol, exit_quantity, target_price)
         self.exit_tickets = [stop_ticket, target_ticket]
 
     def _on_exit_filled(self, fill_price: float):
@@ -381,3 +390,4 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.entry_price = None
         self.entry_direction = 0
         self.exit_tickets = []
+        self.active_contract_symbol = None

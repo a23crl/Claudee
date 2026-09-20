@@ -57,6 +57,20 @@ call that reads `self.symbol` back (`consolidate`, `date_rules.every_day`,
 convention QuantConnect's own example algorithms use (`self._symbol`,
 `self._future`, `self._buy_order_ticket`, ...).
 
+**The canonical continuous symbol is not tradable.** `self._symbol` (from
+`self.add_future(...)`) is only valid for subscribing to data and driving
+the consolidator/schedule — submitting an order on it directly fails at
+runtime with `The security with symbol '/NQ' is marked as non-tradable`
+(a "Backtest Handled Error" that gets logged and skipped, not a hard
+crash, so a version of this file that made this mistake ran to completion
+with zero trades and a flat equity curve, no build-time warning at all).
+Orders have to go on the currently-mapped underlying contract instead —
+`self.securities[self._symbol].mapped` — which is what `_submit_entry`
+captures into `self.active_contract_symbol` and every later
+stop/target/liquidate call for that trade reuses, rather than re-querying
+`.mapped` (which could have already flipped to the next contract if a
+roll happens while the trade is still open).
+
 ## How the translation maps onto the Pine script
 
 | Pine construct | Python/LEAN equivalent |
@@ -96,7 +110,10 @@ trade-for-trade.
    sweep them via QuantConnect's optimizer.
 4. Run the backtest. Check the Orders tab to confirm entries are landing
    inside the intended session windows and that stop/target brackets are
-   getting placed on every fill.
+   getting placed on every fill. Also check the Cloud Terminal log for any
+   `Backtest Handled Error` lines — those don't stop the backtest, so a
+   silently-failing order (wrong symbol, insufficient margin, etc.) can
+   otherwise look identical to "the strategy just never traded."
 
 ## Known simplifications / things to validate before trusting results
 
