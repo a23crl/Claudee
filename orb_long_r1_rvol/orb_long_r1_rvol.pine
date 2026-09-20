@@ -1,0 +1,662 @@
+//@version=6
+// ORB Long r1+RVOL — long-only opening-range breakout, first-half-hour direction
+// filter (r1) + relative-volume filter (RVOL). See spec.md / README.md for the
+// full rule set. This is an INDICATOR, not a strategy: it simulates one trade
+// per day itself (Section 5.5-5.6) because indicators cannot use strategy.*.
+//
+// No look-ahead: all decisions use only bars confirmed on close; fills are
+// simulated at the NEXT bar's open. See Section 5 / Section 11 checklist.
+indicator("ORB Long r1+RVOL", shorttitle = "ORB r1+RVOL", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ---------------------------------------------------------------------------
+// 5.1 Inputs
+// ---------------------------------------------------------------------------
+g1 = "Frozen Parameters"
+g2 = "Risk / Prop Firm"
+g3 = "Data Splits"
+g4 = "Data Hygiene"
+g5 = "Display"
+
+orLen           = input.int(30, "Opening Range Length (minutes)", options = [15, 30, 60], group = g1,
+     tooltip = "Frozen default 30. Robustness values 15 / 60 per spec Section 4. Do not change based on chart appearance.")
+rvolMin         = input.float(1.2, "Minimum RVOL", step = 0.1, minval = 0.0, group = g1,
+     tooltip = "Frozen default 1.2. Robustness values 1.0 / 1.5 per spec Section 4.")
+rvolN           = input.int(20, "RVOL Lookback (sessions)", minval = 1, group = g1,
+     tooltip = "Backward-looking session count for the RVOL baseline. Frozen at 20.")
+stopModeInput   = input.string("OR Midpoint", "Stop Mode",
+     options = ["OR Midpoint", "OR Low", "Entry - 1.0x ATR(14,D,prior)"], group = g1,
+     tooltip = "Frozen default OR Midpoint. Robustness values are OR Low and Entry - 1.0x prior-day ATR(14) per Section 4.")
+targetR         = input.float(1.5, "Target (R multiples)", step = 0.1, minval = 0.1, group = g1,
+     tooltip = "Frozen default 1.5R. Robustness values 1.0R / 2.0R per Section 4.")
+entryCutoffInput = input.string("1230", "Entry Cutoff Time (HHMM, ET)", group = g1,
+     tooltip = "No new entries at or after this time. Frozen default 1230.")
+flatTimeInput   = input.string("1555", "Flat / Backstop Time (HHMM, ET)", group = g1,
+     tooltip = "Force-flat time. Frozen default 1555. Put half-days in Excluded Dates instead of changing this.")
+slipTicks       = input.int(1, "Slippage (ticks per side)", minval = 0, group = g1)
+commissionPerSide = input.float(0.62, "Commission per side ($ per micro contract)", minval = 0.0, step = 0.01, group = g1,
+     tooltip = "Verify against your broker.")
+
+accountSize     = input.float(50000, "Account Size ($)", minval = 1, group = g2)
+riskUSD         = input.float(200, "Risk per Trade ($)", minval = 1, group = g2)
+maxContracts    = input.int(10, "Max Contracts", minval = 1, group = g2)
+profitTargetUSD = input.float(3000, "Profit Target ($)", minval = 1, group = g2)
+trailingDD      = input.float(2000, "Trailing Drawdown ($)", minval = 1, group = g2)
+ddTypeInput     = input.string("EOD", "Drawdown Type", options = ["EOD", "Intraday"], group = g2,
+     tooltip = "Intraday uses the running trade-by-trade equity as an approximation of the true tick-by-tick trailing drawdown (see Section 7.3).")
+dailyLossLimit  = input.float(1000, "Daily Loss Limit ($)", minval = 1, group = g2)
+consistencyPct  = input.float(30, "Consistency % (max share of profit from best day)", minval = 1, maxval = 100, group = g2)
+
+designEndInput     = input.time(timestamp("2023-01-01 00:00 -0500"), "Design End Date", group = g3)
+validEndInput      = input.time(timestamp("2023-07-01 00:00 -0400"), "Validation End Date", group = g3)
+holdoutStartInput  = input.time(timestamp("2023-07-01 00:00 -0400"), "Holdout Start Date", group = g3)
+unlockHoldout      = input.bool(false, "Unlock Holdout", group = g3,
+     tooltip = "Leave false until the candidate is frozen and written into trial_log.md. See Section 7.2. This is a discipline switch, not a performance toggle.")
+
+excludeDatesInput = input.string("", "Excluded Dates (comma-separated YYYY-MM-DD)", group = g4,
+     tooltip = "Roll day, day after roll, holidays, half-days. Excluded from trading AND from the RVOL baseline (Section 3).")
+volSrc          = input.symbol(syminfo.tickerid, "Volume Source Symbol (blank = chart symbol)", group = g4,
+     tooltip = "Alternative e.g. ES1!/NQ1! to avoid roll-distorted volume on the continuous micro contract.")
+
+showLevels = input.bool(true, "Show OR / Entry / Stop / Target Levels", group = g5)
+showTable  = input.bool(true, "Show Stats Table", group = g5)
+showLabels = input.bool(true, "Show Trade Exit Labels", group = g5)
+
+if not (timeframe.isminutes and timeframe.multiplier <= 5)
+    runtime.error("Use a 1 to 5 minute chart")
+
+// ---------------------------------------------------------------------------
+// 5.2 Session and prior close
+// ---------------------------------------------------------------------------
+tz    = "America/New_York"
+inRTH = not na(time(timeframe.period, "0930-1600", tz))
+inOR15 = not na(time(timeframe.period, "0930-0945", tz))
+inOR30 = not na(time(timeframe.period, "0930-1000", tz))
+inOR60 = not na(time(timeframe.period, "0930-1030", tz))
+inOR   = orLen == 15 ? inOR15 : orLen == 30 ? inOR30 : inOR60
+newDay = inRTH and not inRTH[1]
+
+var float prevRthClose = na
+var float lastRthClose = na
+if newDay
+    prevRthClose := lastRthClose
+if inRTH
+    lastRthClose := close
+
+// ---------------------------------------------------------------------------
+// Data hygiene: excluded dates + volume source
+// ---------------------------------------------------------------------------
+f_pad2(n) => n < 10 ? "0" + str.tostring(n) : str.tostring(n)
+f_datetimeStr(t) => str.tostring(year(t, tz)) + "-" + f_pad2(month(t, tz)) + "-" + f_pad2(dayofmonth(t, tz)) +
+     " " + f_pad2(hour(t, tz)) + ":" + f_pad2(minute(t, tz))
+
+var array<string> exArr = array.new<string>()
+if barstate.isfirst
+    raw = str.split(excludeDatesInput, ",")
+    for s in raw
+        trimmed = str.trim(s)
+        if str.length(trimmed) > 0
+            array.push(exArr, trimmed)
+
+var bool isExcluded = false
+var int  sessionIdx = 0
+if newDay
+    sessionIdx += 1
+    todayStr = str.tostring(year(time, tz)) + "-" + f_pad2(month(time, tz)) + "-" + f_pad2(dayofmonth(time, tz))
+    isExcluded := array.indexof(exArr, todayStr) >= 0
+
+barVolume = volSrc == syminfo.tickerid ? volume : request.security(volSrc, timeframe.period, volume, lookahead = barmerge.lookahead_off)
+
+entryCutoff = int(str.tonumber(entryCutoffInput))
+flatTime    = int(str.tonumber(flatTimeInput))
+hhmm        = hour(time, tz) * 100 + minute(time, tz)
+
+// ---------------------------------------------------------------------------
+// 5.3 Opening range and RVOL (backward-looking only)
+// ---------------------------------------------------------------------------
+var float orHi = na
+var float orLo = na
+var float orVol = 0.0
+var float r1 = na
+var bool  orDone = false
+var array<float> orVolHist = array.new<float>()
+var float rvol = na
+var int   orStartBar = na
+var int   orEndBar = na
+
+orJustEnded = inRTH and not inOR and inOR[1]
+
+if newDay
+    orHi := high
+    orLo := low
+    orVol := barVolume
+    orDone := false
+    rvol := na
+    r1 := na
+    orStartBar := bar_index
+else if inOR
+    orHi := math.max(orHi, high)
+    orLo := math.min(orLo, low)
+    orVol += barVolume
+
+if orJustEnded
+    r1 := close[1] / prevRthClose - 1
+    orEndBar := bar_index - 1
+    n = array.size(orVolHist)
+    if n >= rvolN
+        rvol := orVol / array.avg(array.slice(orVolHist, n - rvolN, n))
+    if not isExcluded
+        array.push(orVolHist, orVol)
+    orDone := true
+
+// ---------------------------------------------------------------------------
+// 5.4 Volatility reference (OR-width control & ATR stop variant only)
+// ---------------------------------------------------------------------------
+atrPrevDay = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+
+// ---------------------------------------------------------------------------
+// 5.5 Signal and simulated trade (state machine)
+// state: 0 = flat, 1 = pending entry (fills this bar's open), 2 = long
+// ---------------------------------------------------------------------------
+var int   state = 0
+var bool  tradedToday = false
+var float entryFill = na
+var float stopPx = na
+var float targetPx = na
+var float riskPts = na
+var int   contractsVar = na
+var float rvolAtEntry = na
+var int   sessionAtEntry = na
+
+var array<int>    tr_sample     = array.new<int>()
+var array<float>  tr_R          = array.new<float>()
+var array<float>  tr_rvol       = array.new<float>()
+var array<int>    tr_year       = array.new<int>()
+var array<int>    tr_dow        = array.new<int>()
+var array<int>    tr_skipped    = array.new<int>()   // 1 = skipped (sizing), 0 = executed
+var array<float>  tr_riskPts    = array.new<float>()
+var array<int>    tr_session    = array.new<int>()
+var array<float>  tr_dollarPnl  = array.new<float>()
+
+f_recordTrade(sid, r, rv, yr, dow, skipped, rp, sess, dpnl) =>
+    array.push(tr_sample, sid)
+    array.push(tr_R, r)
+    array.push(tr_rvol, rv)
+    array.push(tr_year, yr)
+    array.push(tr_dow, dow)
+    array.push(tr_skipped, skipped)
+    array.push(tr_riskPts, rp)
+    array.push(tr_session, sess)
+    array.push(tr_dollarPnl, dpnl)
+
+f_sampleId(t) =>
+    t < designEndInput ? 0 : t < validEndInput ? 1 : t < holdoutStartInput ? 3 : 2  // 3 = unclassified gap between validation and holdout
+
+// data-window export placeholders (Section 6.3), non-na only on the relevant bar
+var float plotR1        = na
+var float plotRvol      = na
+var float plotOrHi      = na
+var float plotOrLo      = na
+var int   plotSigFlag   = na
+var float plotEntryFill = na
+var float plotStopPx    = na
+var float plotTargetPx  = na
+var float plotExitPx    = na
+var float plotNetR      = na
+var int   plotContracts = na
+var int   plotIsExcluded = na
+var int   plotSampleId  = na
+var int   plotEventFlag = na   // 1 signal, 2 entry fill, 3 stop exit, 4 target exit, 5 time exit, 6 skipped
+
+// reset per-bar plot values every bar so exports only show a value on the bar it happened
+plotR1        := na
+plotRvol      := na
+plotOrHi      := na
+plotOrLo      := na
+plotSigFlag   := na
+plotEntryFill := na
+plotStopPx    := na
+plotTargetPx  := na
+plotExitPx    := na
+plotNetR      := na
+plotContracts := na
+plotIsExcluded := na
+plotSampleId  := na
+plotEventFlag := na
+
+if orJustEnded
+    plotR1 := r1
+    plotRvol := rvol
+    plotOrHi := orHi
+    plotOrLo := orLo
+
+if newDay
+    plotIsExcluded := isExcluded ? 1 : 0
+    state := 0
+    tradedToday := false
+
+eligible = orDone and not tradedToday and not isExcluded and not na(r1) and r1 > 0 and
+     not na(rvol) and rvol >= rvolMin and hhmm < entryCutoff
+
+sig = barstate.isconfirmed and eligible and state == 0 and close > orHi
+
+var box orBoxObj = na
+var array<box>   allBoxes  = array.new<box>()
+var array<line>  allLines  = array.new<line>()
+var array<label> allLabels = array.new<label>()
+maxDrawKeep = 150
+
+f_pruneBoxes(arr, keep) =>
+    n = array.size(arr)
+    if n > keep
+        for i = 1 to n - keep
+            box.delete(array.shift(arr))
+
+f_pruneLines(arr, keep) =>
+    n = array.size(arr)
+    if n > keep
+        for i = 1 to n - keep
+            line.delete(array.shift(arr))
+
+f_pruneLabels(arr, keep) =>
+    n = array.size(arr)
+    if n > keep
+        for i = 1 to n - keep
+            label.delete(array.shift(arr))
+
+if sig
+    state := 1
+    tradedToday := true
+    plotSigFlag := 1
+    if showLevels and not na(orStartBar) and not na(orEndBar)
+        b = box.new(orStartBar, orHi, orEndBar, orLo, border_color = color.blue, bgcolor = color.new(color.blue, 90))
+        array.push(allBoxes, b)
+        f_pruneBoxes(allBoxes, maxDrawKeep)
+        orBoxObj := b
+else if state == 2
+    // 5.5 management, evaluated in order: time exit, stop, target (stop before target)
+    exitNow = false
+    exitPrice = float(na)
+    exitType = ""
+    if hhmm >= flatTime
+        exitNow := true
+        exitPrice := open
+        exitType := "time"
+    else if open <= stopPx
+        exitNow := true
+        exitPrice := open
+        exitType := "stop"
+    else if low <= stopPx
+        exitNow := true
+        exitPrice := stopPx - slipTicks * syminfo.mintick
+        exitType := "stop"
+    else if high >= targetPx
+        exitNow := true
+        exitPrice := targetPx
+        exitType := "target"
+
+    if exitNow
+        costPts = 2 * slipTicks * syminfo.mintick + 2 * commissionPerSide / syminfo.pointvalue
+        netR = (exitPrice - entryFill - costPts) / riskPts
+        sid = f_sampleId(time)
+        yr = year(time, tz)
+        dow = dayofweek(time, tz)
+        dollarPnl = netR * riskUSD
+        f_recordTrade(sid, netR, rvolAtEntry, yr, dow, 0, riskPts, sessionAtEntry, dollarPnl)
+
+        plotExitPx := exitPrice
+        plotNetR := netR
+        plotContracts := contractsVar
+        plotSampleId := sid
+        plotEventFlag := exitType == "stop" ? 3 : exitType == "target" ? 4 : 5
+
+        if showLabels
+            lbl = label.new(bar_index, exitPrice, str.tostring(netR, "#.##") + "R",
+                 style = exitNow and netR >= 0 ? label.style_label_down : label.style_label_up,
+                 color = netR >= 0 ? color.green : color.red, textcolor = color.white)
+            array.push(allLabels, lbl)
+            f_pruneLabels(allLabels, maxDrawKeep)
+
+        state := 0
+
+if state == 1 and not sig
+    // this is the bar AFTER the signal bar: fill at this bar's open
+    entryFill := open + slipTicks * syminfo.mintick
+    switch stopModeInput
+        "OR Midpoint" => stopPx := (orHi + orLo) / 2
+        "OR Low"      => stopPx := orLo
+        => stopPx := entryFill - 1.0 * atrPrevDay
+    riskPts := entryFill - stopPx
+    targetPx := entryFill + targetR * riskPts
+    contractsVar := na(riskPts) or riskPts <= 0 ? int(na) : int(math.floor(riskUSD / (riskPts * syminfo.pointvalue)))
+    rvolAtEntry := rvol
+    sessionAtEntry := sessionIdx
+
+    plotEntryFill := entryFill
+    plotStopPx := stopPx
+    plotTargetPx := targetPx
+    plotEventFlag := 2
+
+    if na(contractsVar) or contractsVar < 1
+        sid = f_sampleId(time)
+        yr = year(time, tz)
+        dow = dayofweek(time, tz)
+        f_recordTrade(sid, na, rvolAtEntry, yr, dow, 1, riskPts, sessionIdx, 0.0)
+        plotSampleId := sid
+        plotEventFlag := 6
+        state := 0
+    else
+        contractsVar := math.min(contractsVar, maxContracts)
+        state := 2
+        if showLevels
+            l1 = line.new(bar_index, entryFill, bar_index + 1, entryFill, color = color.gray, extend = extend.right)
+            l2 = line.new(bar_index, stopPx, bar_index + 1, stopPx, color = color.red, extend = extend.right)
+            l3 = line.new(bar_index, targetPx, bar_index + 1, targetPx, color = color.green, extend = extend.right)
+            array.push(allLines, l1)
+            array.push(allLines, l2)
+            array.push(allLines, l3)
+            f_pruneLines(allLines, maxDrawKeep)
+
+// ---------------------------------------------------------------------------
+// 5.6 / 9 Statistics engine — recomputed fully at the last bar
+// ---------------------------------------------------------------------------
+var float chartFirstBarTime = na
+if barstate.isfirst
+    chartFirstBarTime := time
+insufficientHistory = chartFirstBarTime > designEndInput
+
+f_sampleStats(sidFilter) =>
+    n = array.size(tr_R)
+    trades = 0
+    skipped = 0
+    wins = 0
+    sumR = 0.0
+    grossWin = 0.0
+    grossLoss = 0.0
+    curStreak = 0
+    maxStreak = 0
+    equity = 0.0
+    peak = 0.0
+    maxDD = 0.0
+    sumTicks = 0.0
+    for i = 0 to n - 1
+        if array.get(tr_sample, i) == sidFilter
+            if array.get(tr_skipped, i) == 1
+                skipped += 1
+            else
+                trades += 1
+                r = array.get(tr_R, i)
+                rp = array.get(tr_riskPts, i)
+                sumR += r
+                sumTicks += r * rp / syminfo.mintick
+                if r > 0
+                    wins += 1
+                    grossWin += r
+                    curStreak := 0
+                else
+                    grossLoss += -r
+                    curStreak += 1
+                    maxStreak := math.max(maxStreak, curStreak)
+                equity += r
+                peak := math.max(peak, equity)
+                maxDD := math.max(maxDD, peak - equity)
+    winRate = trades > 0 ? wins / trades * 100 : na
+    avgR = trades > 0 ? sumR / trades : na
+    avgWin = wins > 0 ? grossWin / wins : na
+    losses = trades - wins
+    avgLoss = losses > 0 ? grossLoss / losses : na
+    payoff = (not na(avgWin) and not na(avgLoss) and avgLoss != 0) ? avgWin / avgLoss : na
+    pf = grossLoss > 0 ? grossWin / grossLoss : na
+    avgTicks = trades > 0 ? sumTicks / trades : na
+    [trades, winRate, avgR, payoff, pf, maxStreak, maxDD, avgTicks, skipped]
+
+// ---------------------------------------------------------------------------
+// 7.3 Prop-challenge sequential path check (light, trade-granularity approximation)
+// ---------------------------------------------------------------------------
+f_propSim() =>
+    n = array.size(tr_R)
+    attempts = 0
+    passes = 0
+    breaches = 0
+    daysSumPass = 0.0
+    equity = accountSize
+    peak = accountSize
+    attemptStartEquity = accountSize
+    attemptStartSession = -1
+    dayPnl = 0.0
+    curSession = -1
+    bestDayProfit = 0.0
+    totalAttemptProfit = 0.0
+    active = false
+    for i = 0 to n - 1
+        if array.get(tr_skipped, i) == 0
+            sess = array.get(tr_session, i)
+            sid = array.get(tr_sample, i)
+            if sid != 2 or unlockHoldout   // respect holdout mask (Section 7.2)
+                if not active
+                    active := true
+                    attempts += 1
+                    equity := accountSize
+                    peak := accountSize
+                    attemptStartSession := sess
+                    totalAttemptProfit := 0.0
+                    bestDayProfit := 0.0
+                    dayPnl := 0.0
+                    curSession := sess
+                if sess != curSession
+                    // new day: settle EOD drawdown check, reset day pnl
+                    if ddTypeInput == "EOD"
+                        if peak - equity >= trailingDD
+                            breaches += 1
+                            active := false
+                    bestDayProfit := math.max(bestDayProfit, dayPnl)
+                    dayPnl := 0.0
+                    curSession := sess
+                if active
+                    dpnl = array.get(tr_dollarPnl, i)
+                    equity += dpnl
+                    dayPnl += dpnl
+                    totalAttemptProfit += dpnl
+                    peak := math.max(peak, equity)
+                    if ddTypeInput == "Intraday" and (peak - equity >= trailingDD)
+                        breaches += 1
+                        active := false
+                    else if dayPnl <= -dailyLossLimit
+                        breaches += 1
+                        active := false
+                    else if totalAttemptProfit >= profitTargetUSD
+                        bestDayProfit := math.max(bestDayProfit, dayPnl)
+                        consistencyOk = totalAttemptProfit > 0 and (bestDayProfit / totalAttemptProfit * 100) <= consistencyPct
+                        if consistencyOk
+                            passes += 1
+                            daysSumPass += (sess - attemptStartSession + 1)
+                            active := false
+    currentBuffer = active ? trailingDD - (peak - equity) : na
+    avgDaysToPass = passes > 0 ? daysSumPass / passes : na
+    [attempts, passes, breaches, avgDaysToPass, currentBuffer]
+
+// ---------------------------------------------------------------------------
+// Table (Section 5.6 / 7.3), updated only on the last bar
+// ---------------------------------------------------------------------------
+var table statsTable = table.new(position.top_right, 6, 12, border_width = 1)
+var table bucketTable = table.new(position.bottom_right, 3, 6, border_width = 1)
+var table yearTable = table.new(position.bottom_left, 3, 20, border_width = 1)
+
+f_cell(tb, c, r, txt) => table.cell(tb, c, r, txt, text_color = color.white, bgcolor = color.new(color.black, 20))
+f_fmt(v, fmt) => na(v) ? "n/a" : str.tostring(v, fmt)
+
+if showTable and barstate.islast
+    if insufficientHistory
+        f_cell(statsTable, 0, 0, "ORB Long r1+RVOL")
+        f_cell(statsTable, 1, 0, "INSUFFICIENT HISTORY")
+    else
+        [dTr, dWR, dAvgR, dPay, dPF, dStk, dDD, dTk, dSk] = f_sampleStats(0)
+        [vTr, vWR, vAvgR, vPay, vPF, vStk, vDD, vTk, vSk] = f_sampleStats(1)
+        [hTr, hWR, hAvgR, hPay, hPF, hStk, hDD, hTk, hSk] = f_sampleStats(2)
+        allTrades = dTr + vTr + (unlockHoldout ? hTr : 0)
+
+        f_cell(statsTable, 0, 0, "Metric")
+        f_cell(statsTable, 1, 0, "Design")
+        f_cell(statsTable, 2, 0, "Validation")
+        f_cell(statsTable, 3, 0, unlockHoldout ? "Holdout" : "LOCKED")
+        f_cell(statsTable, 4, 0, "All-Visible")
+        f_cell(statsTable, 5, 0, "Sessions seen: " + str.tostring(sessionIdx))
+
+        f_cell(statsTable, 0, 1, "Trades")
+        f_cell(statsTable, 1, 1, str.tostring(dTr))
+        f_cell(statsTable, 2, 1, str.tostring(vTr))
+        f_cell(statsTable, 3, 1, unlockHoldout ? str.tostring(hTr) : "-")
+        f_cell(statsTable, 4, 1, str.tostring(allTrades))
+
+        f_cell(statsTable, 0, 2, "Win %")
+        f_cell(statsTable, 1, 2, f_fmt(dWR, "#.#"))
+        f_cell(statsTable, 2, 2, f_fmt(vWR, "#.#"))
+        f_cell(statsTable, 3, 2, unlockHoldout ? f_fmt(hWR, "#.#") : "-")
+        f_cell(statsTable, 4, 2, "")
+
+        f_cell(statsTable, 0, 3, "Avg R (expectancy)")
+        f_cell(statsTable, 1, 3, f_fmt(dAvgR, "#.###"))
+        f_cell(statsTable, 2, 3, f_fmt(vAvgR, "#.###"))
+        f_cell(statsTable, 3, 3, unlockHoldout ? f_fmt(hAvgR, "#.###") : "-")
+        f_cell(statsTable, 4, 3, "")
+
+        f_cell(statsTable, 0, 4, "Payoff ratio")
+        f_cell(statsTable, 1, 4, f_fmt(dPay, "#.##"))
+        f_cell(statsTable, 2, 4, f_fmt(vPay, "#.##"))
+        f_cell(statsTable, 3, 4, unlockHoldout ? f_fmt(hPay, "#.##") : "-")
+        f_cell(statsTable, 4, 4, "")
+
+        f_cell(statsTable, 0, 5, "Profit factor")
+        f_cell(statsTable, 1, 5, f_fmt(dPF, "#.##"))
+        f_cell(statsTable, 2, 5, f_fmt(vPF, "#.##"))
+        f_cell(statsTable, 3, 5, unlockHoldout ? f_fmt(hPF, "#.##") : "-")
+        f_cell(statsTable, 4, 5, "")
+
+        f_cell(statsTable, 0, 6, "Max losing streak")
+        f_cell(statsTable, 1, 6, str.tostring(dStk))
+        f_cell(statsTable, 2, 6, str.tostring(vStk))
+        f_cell(statsTable, 3, 6, unlockHoldout ? str.tostring(hStk) : "-")
+        f_cell(statsTable, 4, 6, "")
+
+        f_cell(statsTable, 0, 7, "Max DD (R)")
+        f_cell(statsTable, 1, 7, str.tostring(dDD, "#.##"))
+        f_cell(statsTable, 2, 7, str.tostring(vDD, "#.##"))
+        f_cell(statsTable, 3, 7, unlockHoldout ? str.tostring(hDD, "#.##") : "-")
+        f_cell(statsTable, 4, 7, "")
+
+        f_cell(statsTable, 0, 8, "Avg trade (ticks)")
+        f_cell(statsTable, 1, 8, f_fmt(dTk, "#.#"))
+        f_cell(statsTable, 2, 8, f_fmt(vTk, "#.#"))
+        f_cell(statsTable, 3, 8, unlockHoldout ? f_fmt(hTk, "#.#") : "-")
+        f_cell(statsTable, 4, 8, "")
+
+        f_cell(statsTable, 0, 9, "Skipped (risk too small)")
+        f_cell(statsTable, 1, 9, str.tostring(dSk))
+        f_cell(statsTable, 2, 9, str.tostring(vSk))
+        f_cell(statsTable, 3, 9, unlockHoldout ? str.tostring(hSk) : "-")
+        f_cell(statsTable, 4, 9, "")
+
+        [pAtt, pPass, pBreach, pAvgDays, pBuffer] = f_propSim()
+        f_cell(statsTable, 0, 10, "Prop attempts / pass / breach")
+        f_cell(statsTable, 1, 10, str.tostring(pAtt) + " / " + str.tostring(pPass) + " / " + str.tostring(pBreach))
+        f_cell(statsTable, 2, 10, "Avg days to pass: " + (na(pAvgDays) ? "n/a" : str.tostring(pAvgDays, "#.#")))
+        f_cell(statsTable, 3, 10, "Buffer: " + (na(pBuffer) ? "n/a" : "$" + str.tostring(pBuffer, "#")))
+        bufWarn = not na(pBuffer) and pBuffer < trailingDD * 0.25
+        f_cell(statsTable, 4, 10, bufWarn ? "LOW BUFFER" : "ok")
+
+        f_cell(statsTable, 0, 11, unlockHoldout ? "HOLDOUT VIEWED - no further tuning allowed" : "")
+        f_cell(statsTable, 1, 11, "")
+        f_cell(statsTable, 2, 11, "")
+        f_cell(statsTable, 3, 11, "")
+        f_cell(statsTable, 4, 11, "")
+
+        // RVOL bucket diagnostic (design + validation only, never used to change the threshold)
+        f_cell(bucketTable, 0, 0, "RVOL bucket")
+        f_cell(bucketTable, 1, 0, "Trades")
+        f_cell(bucketTable, 2, 0, "Avg R")
+        bucketEdges = array.from(0.0, 0.8, 1.2, 1.6, 999999.0)
+        bucketNames = array.from("<0.8", "0.8-1.2", "1.2-1.6", ">=1.6")
+        for bi = 0 to 3
+            lo = array.get(bucketEdges, bi)
+            hi = array.get(bucketEdges, bi + 1)
+            bTrades = 0
+            bSumR = 0.0
+            for i = 0 to array.size(tr_R) - 1
+                sidv = array.get(tr_sample, i)
+                if (sidv == 0 or sidv == 1) and array.get(tr_skipped, i) == 0
+                    rv = array.get(tr_rvol, i)
+                    if rv >= lo and rv < hi
+                        bTrades += 1
+                        bSumR += array.get(tr_R, i)
+            f_cell(bucketTable, 0, bi + 1, array.get(bucketNames, bi))
+            f_cell(bucketTable, 1, bi + 1, str.tostring(bTrades))
+            f_cell(bucketTable, 2, bi + 1, bTrades > 0 ? str.tostring(bSumR / bTrades, "#.###") : "n/a")
+
+        // Year-by-year (design + validation only, to expose single-year dependence)
+        f_cell(yearTable, 0, 0, "Year")
+        f_cell(yearTable, 1, 0, "Trades")
+        f_cell(yearTable, 2, 0, "Total R")
+        var array<int> seenYears = array.new<int>()
+        array.clear(seenYears)
+        for i = 0 to array.size(tr_R) - 1
+            sidv = array.get(tr_sample, i)
+            if (sidv == 0 or sidv == 1) and array.get(tr_skipped, i) == 0
+                yv = array.get(tr_year, i)
+                if array.indexof(seenYears, yv) < 0
+                    array.push(seenYears, yv)
+        for yi = 0 to math.min(array.size(seenYears) - 1, 18)
+            yv = array.get(seenYears, yi)
+            yTrades = 0
+            ySumR = 0.0
+            for i = 0 to array.size(tr_R) - 1
+                if array.get(tr_year, i) == yv and array.get(tr_skipped, i) == 0
+                    sidv = array.get(tr_sample, i)
+                    if sidv == 0 or sidv == 1
+                        yTrades += 1
+                        ySumR += array.get(tr_R, i)
+            f_cell(yearTable, 0, yi + 1, str.tostring(yv))
+            f_cell(yearTable, 1, yi + 1, str.tostring(yTrades))
+            f_cell(yearTable, 2, yi + 1, str.tostring(ySumR, "#.##"))
+
+// ---------------------------------------------------------------------------
+// 6.2 Alerts (once per bar close, no repaint)
+// ---------------------------------------------------------------------------
+if sig
+    alert("ORB signal | " + syminfo.ticker + " | " + f_datetimeStr(time) +
+         " | ref=" + str.tostring(close) + " | r1=" + str.tostring(r1, "#.####") + " | rvol=" + str.tostring(rvol, "#.##"),
+         alert.freq_once_per_bar_close)
+
+if state == 1 and not sig
+    alert("ORB entry fill | " + syminfo.ticker + " | fill=" + str.tostring(entryFill) +
+         " | stop=" + str.tostring(stopPx) + " | target=" + str.tostring(targetPx) +
+         " | contracts=" + str.tostring(contractsVar), alert.freq_once_per_bar_close)
+
+if not na(plotEventFlag) and plotEventFlag == 3
+    alert("ORB stop hit | " + syminfo.ticker + " | exit=" + str.tostring(plotExitPx) + " | netR=" + str.tostring(plotNetR, "#.###"), alert.freq_once_per_bar_close)
+if not na(plotEventFlag) and plotEventFlag == 4
+    alert("ORB target hit | " + syminfo.ticker + " | exit=" + str.tostring(plotExitPx) + " | netR=" + str.tostring(plotNetR, "#.###"), alert.freq_once_per_bar_close)
+if not na(plotEventFlag) and plotEventFlag == 5
+    alert("ORB time exit | " + syminfo.ticker + " | exit=" + str.tostring(plotExitPx) + " | netR=" + str.tostring(plotNetR, "#.###"), alert.freq_once_per_bar_close)
+
+if barstate.islast and not insufficientHistory
+    [pAtt2, pPass2, pBreach2, pAvgDays2, pBuffer2] = f_propSim()
+    if not na(pBuffer2) and pBuffer2 < trailingDD * 0.25
+        alert("ORB prop-rule warning | drawdown buffer below 25% | buffer=$" + str.tostring(pBuffer2, "#"), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+// 6.3 Data-window exports for the Python validation step (Section 9)
+// ---------------------------------------------------------------------------
+plot(plotR1, "r1", display = display.data_window)
+plot(plotRvol, "rvol", display = display.data_window)
+plot(plotOrHi, "orHi", display = display.data_window)
+plot(plotOrLo, "orLo", display = display.data_window)
+plot(plotSigFlag, "sigFlag", display = display.data_window)
+plot(plotEntryFill, "entryFill", display = display.data_window)
+plot(plotStopPx, "stopPx", display = display.data_window)
+plot(plotTargetPx, "targetPx", display = display.data_window)
+plot(plotExitPx, "exitPx", display = display.data_window)
+plot(plotNetR, "netR", display = display.data_window)
+plot(plotContracts, "contracts", display = display.data_window)
+plot(plotIsExcluded, "isExcludedDay", display = display.data_window)
+plot(plotSampleId, "sampleId", display = display.data_window)
+plot(plotEventFlag, "eventFlag", display = display.data_window)
