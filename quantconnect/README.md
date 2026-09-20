@@ -46,11 +46,22 @@ constant. That constant almost certainly exists under that name (confirmed
 by analogy with `Futures.Indices.SP_500_E_MINI` in QuantConnect's own
 examples), but the raw ticker sidesteps depending on that guess entirely.
 
+One naming pitfall worth flagging if you fork this: `QCAlgorithm` itself
+has a built-in `symbol(...)` method (converts a ticker string to a `Symbol`
+object). Naming an instance field `self.symbol` shadows/collides with it,
+which the type checker reports as "cannot assign to a method" plus a cascade
+of unrelated-looking "no overload variant matches" errors on every later
+call that reads `self.symbol` back (`consolidate`, `date_rules.every_day`,
+`portfolio[...]`, `liquidate`, `market_order`, ...). This file stores it as
+`self._symbol` instead, matching the underscore-prefixed instance-field
+convention QuantConnect's own example algorithms use (`self._symbol`,
+`self._future`, `self._buy_order_ticket`, ...).
+
 ## How the translation maps onto the Pine script
 
 | Pine construct | Python/LEAN equivalent |
 |---|---|
-| 5-minute chart bars | `self.consolidate(self.symbol, timedelta(minutes=5), self.on_five_minute_bar)` |
+| 5-minute chart bars | `self.consolidate(self._symbol, timedelta(minutes=5), self.on_five_minute_bar)` |
 | Session-anchored `cumPV`/`cumVol` VWAP | Manual `cum_pv`/`cum_vol` accumulators, reset on a session-date change (`_update_vwap`) |
 | `vwapVal[N]`, `close[N]` | `RollingWindow`, indexed the same way (`window[0]` = current, `window[N]` = N bars back) |
 | `var bool longBiasActive/longFired` state machine | Same fields as instance attributes, same transition logic |

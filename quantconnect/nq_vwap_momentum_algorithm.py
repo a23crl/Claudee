@@ -109,11 +109,11 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             data_normalization_mode=DataNormalizationMode.RAW,
             contract_depth_offset=0,
         )
-        self.symbol = future.symbol
+        self._symbol = future.symbol
 
         # 5-minute consolidator, tied to the canonical continuous symbol --
         # LEAN keeps feeding it the currently-mapped contract's bars.
-        self.consolidate(self.symbol, timedelta(minutes=5), self.on_five_minute_bar)
+        self.consolidate(self._symbol, timedelta(minutes=5), self.on_five_minute_bar)
 
         # ------------------------------------------------------------------
         # VWAP accumulator state (manual, session-anchored -- QC's built-in
@@ -152,12 +152,12 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.losses_today = 0
 
         self.schedule.on(
-            self.date_rules.every_day(self.symbol),
+            self.date_rules.every_day(self._symbol),
             self.time_rules.at(0, 0),
             self.reset_daily_counters,
         )
         self.schedule.on(
-            self.date_rules.every_day(self.symbol),
+            self.date_rules.every_day(self._symbol),
             self.time_rules.at(16, 55),
             self.flatten_at_end_of_day,
         )
@@ -170,7 +170,7 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
     # ----------------------------------------------------------------------
     def on_data(self, data: Slice):
         for changed_event in data.symbol_changed_events.values():
-            if changed_event.symbol == self.symbol:
+            if changed_event.symbol == self._symbol:
                 # Raw prices are discontinuous across a roll, so don't try
                 # to carry a position, a resting bracket, or a bias episode
                 # across it -- flatten and reset instead.
@@ -199,8 +199,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
                 ticket.cancel()
         self.exit_tickets = []
 
-        if self.portfolio[self.symbol].invested:
-            liquidate_tickets = self.liquidate(self.symbol, "eod_flatten")
+        if self.portfolio[self._symbol].invested:
+            liquidate_tickets = self.liquidate(self._symbol, "eod_flatten")
             # Route the liquidation fill through the same exit-fill handling
             # (pnl / loss-count bookkeeping, state reset) as a stop/target.
             self.exit_tickets = list(liquidate_tickets)
@@ -328,7 +328,7 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
     # ----------------------------------------------------------------------
     def _submit_entry(self, direction: int):
         quantity = direction * self.order_size
-        self.entry_ticket = self.market_order(self.symbol, quantity)
+        self.entry_ticket = self.market_order(self._symbol, quantity)
         self.pending_direction = direction
         self.in_position = True
         self.trades_today += 1
@@ -358,8 +358,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             stop_price = self.entry_price + self.short_stop_points
             target_price = self.entry_price - self.short_target_points
 
-        stop_ticket = self.stop_market_order(self.symbol, exit_quantity, stop_price)
-        target_ticket = self.limit_order(self.symbol, exit_quantity, target_price)
+        stop_ticket = self.stop_market_order(self._symbol, exit_quantity, stop_price)
+        target_ticket = self.limit_order(self._symbol, exit_quantity, target_price)
         self.exit_tickets = [stop_ticket, target_ticket]
 
     def _on_exit_filled(self, fill_price: float):
