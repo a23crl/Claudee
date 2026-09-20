@@ -55,7 +55,7 @@ unlockHoldout      = input.bool(false, "Unlock Holdout", group = g3,
 
 excludeDatesInput = input.string("", "Excluded Dates (comma-separated YYYY-MM-DD)", group = g4,
      tooltip = "Roll day, day after roll, holidays, half-days. Excluded from trading AND from the RVOL baseline (Section 3).")
-volSrc          = input.symbol(syminfo.tickerid, "Volume Source Symbol (blank = chart symbol)", group = g4,
+volSrc          = input.symbol("", "Volume Source Symbol (blank = chart symbol)", group = g4,
      tooltip = "Alternative e.g. ES1!/NQ1! to avoid roll-distorted volume on the continuous micro contract.")
 
 showLevels = input.bool(true, "Show OR / Entry / Stop / Target Levels", group = g5)
@@ -105,7 +105,7 @@ if newDay
     todayStr = str.tostring(year(time, tz)) + "-" + f_pad2(month(time, tz)) + "-" + f_pad2(dayofmonth(time, tz))
     isExcluded := array.indexof(exArr, todayStr) >= 0
 
-barVolume = volSrc == syminfo.tickerid ? volume : request.security(volSrc, timeframe.period, volume, lookahead = barmerge.lookahead_off)
+barVolume = volSrc == "" ? volume : request.security(volSrc, timeframe.period, volume, lookahead = barmerge.lookahead_off)
 
 entryCutoff = int(str.tonumber(entryCutoffInput))
 flatTime    = int(str.tonumber(flatTimeInput))
@@ -341,7 +341,7 @@ if state == 1 and not sig
         sid = f_sampleId(time)
         yr = year(time, tz)
         dow = dayofweek(time, tz)
-        f_recordTrade(sid, na, rvolAtEntry, yr, dow, 1, riskPts, sessionIdx, 0.0)
+        f_recordTrade(sid, float(na), rvolAtEntry, yr, dow, 1, riskPts, sessionIdx, 0.0)
         plotSampleId := sid
         plotEventFlag := 6
         state := 0
