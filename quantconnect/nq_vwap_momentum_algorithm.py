@@ -1,5 +1,14 @@
 # QuantConnect (LEAN) Python port of tradingview/nq_vwap_momentum_strategy.pine.
 #
+# Written against LEAN's PEP8/snake_case Python API (initialize, on_data,
+# self.add_future, Resolution.MINUTE, etc.) -- verified against
+# QuantConnect/Lean's own current example algorithms (BasicTemplateFuturesAlgorithm.py,
+# ScheduledEventsAlgorithm.py, ContinuousFutureRegressionAlgorithm.py,
+# StopLimitOrderRegressionAlgorithm.py, RollingWindowAlgorithm.py,
+# ConsolidateRegressionAlgorithm.py) since some Cloud IDE projects' engine
+# builds no longer accept the older PascalCase C#-style names (SetStartDate,
+# AddFuture, Resolution.Minute, ...) that an earlier version of this file used.
+#
 # Same rules, same state machine, ported bar-for-bar from the Pine script:
 #
 #   LONG bias   : close > session VWAP, VWAP rising over the last N bars,
@@ -25,12 +34,13 @@
 # "15 minutes" / "1 hour" windows are expressed as bar counts (3 and 12)
 # for the same reason as the Pine version -- change them if you resample.
 #
-# This trades the continuous NQ future directly (DataNormalizationMode.Raw,
+# This trades the continuous NQ future directly (DataNormalizationMode.RAW,
 # so absolute price levels are real traded prices -- required since the
 # stop/target are fixed point offsets, not percentages). Raw mode has price
 # discontinuities across contract rolls, so the algorithm flattens and
-# resets its state whenever the mapped contract changes (OnSymbolChangedEvents)
-# rather than trying to carry a position or bias episode across a roll.
+# resets its state whenever the mapped contract changes (detected via
+# data.symbol_changed_events in on_data) rather than trying to carry a
+# position or bias episode across a roll.
 #
 # Not proven profitable -- same disclaimer as the Pine script and the rest
 # of this repo. Validate with QuantConnect's Research/backtest tools,
@@ -42,16 +52,19 @@ from AlgorithmImports import *
 
 class NQVWAPMomentumAlgorithm(QCAlgorithm):
 
-    def Initialize(self):
+    def initialize(self):
         # ------------------------------------------------------------------
         # Backtest window / cash -- adjust to taste.
         # ------------------------------------------------------------------
-        self.SetStartDate(2022, 1, 1)
-        self.SetEndDate(2024, 1, 1)
-        self.SetCash(100000)
+        self.set_start_date(2022, 1, 1)
+        self.set_end_date(2024, 1, 1)
+        self.set_cash(100000)
 
         # All session-time logic below assumes algorithm time is Eastern.
-        self.SetTimeZone(TimeZones.NewYork)
+        # Passed as a plain IANA string (documented, supported) rather than
+        # a TimeZones.* constant, since that enum class's exact Python
+        # attribute spelling isn't confirmed against this engine build.
+        self.set_time_zone("America/New_York")
 
         # ------------------------------------------------------------------
         # Strategy inputs -- names mirror the Pine script's inputs 1:1.
@@ -83,21 +96,24 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
 
         # ------------------------------------------------------------------
         # Instrument -- continuous NQ future, raw prices (see module docstring
-        # for why raw rather than back-adjusted).
+        # for why raw rather than back-adjusted). "NQ" + Market.CME is used
+        # directly instead of Futures.Indices.NASDAQ_100_E_MINI so the symbol
+        # doesn't depend on that constant's exact generated spelling.
         # ------------------------------------------------------------------
-        future = self.AddFuture(
-            Futures.Indices.NASDAQ100EMini,
-            resolution=Resolution.Minute,
-            extendedMarketHours=True,
-            dataMappingMode=DataMappingMode.OpenInterest,
-            dataNormalizationMode=DataNormalizationMode.Raw,
-            contractDepthOffset=0,
+        future = self.add_future(
+            "NQ",
+            market=Market.CME,
+            resolution=Resolution.MINUTE,
+            extended_market_hours=True,
+            data_mapping_mode=DataMappingMode.OPEN_INTEREST,
+            data_normalization_mode=DataNormalizationMode.RAW,
+            contract_depth_offset=0,
         )
-        self.symbol = future.Symbol
+        self.symbol = future.symbol
 
         # 5-minute consolidator, tied to the canonical continuous symbol --
         # LEAN keeps feeding it the currently-mapped contract's bars.
-        self.Consolidate(self.symbol, timedelta(minutes=5), self.OnFiveMinuteBar)
+        self.consolidate(self.symbol, timedelta(minutes=5), self.on_five_minute_bar)
 
         # ------------------------------------------------------------------
         # VWAP accumulator state (manual, session-anchored -- QC's built-in
@@ -108,8 +124,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.current_session_date = None
 
         window_size = max(self.vwap_slope_lookback, self.momentum_lookback) + 1
-        self.vwap_window = RollingWindow[float](window_size)
-        self.close_window = RollingWindow[float](window_size)
+        self.vwap_window = RollingWindow(window_size)
+        self.close_window = RollingWindow(window_size)
 
         # ------------------------------------------------------------------
         # Trigger state machine (mirrors the Pine script's var bools).
@@ -135,67 +151,71 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.trades_today = 0
         self.losses_today = 0
 
-        self.Schedule.On(
-            self.DateRules.EveryDay(self.symbol),
-            self.TimeRules.At(0, 0),
-            self.ResetDailyCounters,
+        self.schedule.on(
+            self.date_rules.every_day(self.symbol),
+            self.time_rules.at(0, 0),
+            self.reset_daily_counters,
         )
-        self.Schedule.On(
-            self.DateRules.EveryDay(self.symbol),
-            self.TimeRules.At(16, 55),
-            self.FlattenAtEndOfDay,
+        self.schedule.on(
+            self.date_rules.every_day(self.symbol),
+            self.time_rules.at(16, 55),
+            self.flatten_at_end_of_day,
         )
 
-        self.SetWarmUp(timedelta(days=3))
+        self.set_warm_up(timedelta(days=3))
 
     # ----------------------------------------------------------------------
-    # Daily resets / EOD flatten
+    # Slice handler -- only used to catch contract-roll events; all trading
+    # logic runs in on_five_minute_bar via the consolidator above.
     # ----------------------------------------------------------------------
-    def ResetDailyCounters(self):
-        self.trades_today = 0
-        self.losses_today = 0
-
-    def FlattenAtEndOfDay(self):
-        if self.entry_ticket is not None and self.entry_ticket.Status not in (
-            OrderStatus.Filled, OrderStatus.Canceled, OrderStatus.Invalid
-        ):
-            self.entry_ticket.Cancel()
-
-        for ticket in self.exit_tickets:
-            if ticket.Status not in (OrderStatus.Filled, OrderStatus.Canceled, OrderStatus.Invalid):
-                ticket.Cancel()
-        self.exit_tickets = []
-
-        if self.Portfolio[self.symbol].Invested:
-            liquidate_tickets = self.Liquidate(self.symbol, "eod_flatten")
-            # Route the liquidation fill through the same exit-fill handling
-            # (pnl / loss-count bookkeeping, state reset) as a stop/target.
-            self.exit_tickets = list(liquidate_tickets)
-        else:
-            self._reset_position_state()
-
-    def OnSymbolChangedEvents(self, symbolChangedEvents):
-        # Contract roll on the continuous future -- raw prices are
-        # discontinuous across this boundary, so don't try to carry a
-        # position, a resting bracket, or a bias episode across it.
-        for changed in symbolChangedEvents.Values:
-            if changed.Symbol == self.symbol:
-                self.Log(f"Contract roll {changed.OldSymbol} -> {changed.NewSymbol}: flattening.")
-                self.FlattenAtEndOfDay()
+    def on_data(self, data: Slice):
+        for changed_event in data.symbol_changed_events.values():
+            if changed_event.symbol == self.symbol:
+                # Raw prices are discontinuous across a roll, so don't try
+                # to carry a position, a resting bracket, or a bias episode
+                # across it -- flatten and reset instead.
+                self.log(f"Contract roll {changed_event.old_symbol} -> {changed_event.new_symbol}: flattening.")
+                self.flatten_at_end_of_day()
                 self.long_bias_active = False
                 self.long_fired = False
                 self.short_bias_active = False
                 self.short_fired = False
 
     # ----------------------------------------------------------------------
+    # Daily resets / EOD flatten
+    # ----------------------------------------------------------------------
+    def reset_daily_counters(self):
+        self.trades_today = 0
+        self.losses_today = 0
+
+    def flatten_at_end_of_day(self):
+        if self.entry_ticket is not None and self.entry_ticket.status not in (
+            OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.INVALID
+        ):
+            self.entry_ticket.cancel()
+
+        for ticket in self.exit_tickets:
+            if ticket.status not in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.INVALID):
+                ticket.cancel()
+        self.exit_tickets = []
+
+        if self.portfolio[self.symbol].invested:
+            liquidate_tickets = self.liquidate(self.symbol, "eod_flatten")
+            # Route the liquidation fill through the same exit-fill handling
+            # (pnl / loss-count bookkeeping, state reset) as a stop/target.
+            self.exit_tickets = list(liquidate_tickets)
+        else:
+            self._reset_position_state()
+
+    # ----------------------------------------------------------------------
     # Main 5-minute bar handler -- equivalent of the Pine script's per-bar
     # top-level execution.
     # ----------------------------------------------------------------------
-    def OnFiveMinuteBar(self, bar: TradeBar):
+    def on_five_minute_bar(self, bar: TradeBar):
         self._update_vwap(bar)
         self._update_windows(bar)
 
-        if self.IsWarmingUp:
+        if self.is_warming_up:
             return
 
         vwap_value = self._current_vwap()
@@ -203,25 +223,25 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             return
 
         vwap_rising = (
-            self.vwap_window.Count > self.vwap_slope_lookback
+            self.vwap_window.count > self.vwap_slope_lookback
             and self.vwap_window[0] > self.vwap_window[self.vwap_slope_lookback]
         )
         vwap_falling = (
-            self.vwap_window.Count > self.vwap_slope_lookback
+            self.vwap_window.count > self.vwap_slope_lookback
             and self.vwap_window[0] < self.vwap_window[self.vwap_slope_lookback]
         )
 
         momentum_up = False
         momentum_down = False
-        if self.close_window.Count > self.momentum_lookback:
+        if self.close_window.count > self.momentum_lookback:
             past_close = self.close_window[self.momentum_lookback]
             if past_close != 0:
                 pct_change = (self.close_window[0] - past_close) / past_close * 100.0
                 momentum_up = pct_change >= self.momentum_pct
                 momentum_down = pct_change <= -self.momentum_pct
 
-        long_bias = bar.Close > vwap_value and vwap_rising and momentum_up
-        short_bias = bar.Close < vwap_value and vwap_falling and momentum_down
+        long_bias = bar.close > vwap_value and vwap_rising and momentum_up
+        short_bias = bar.close < vwap_value and vwap_falling and momentum_down
 
         # --- trigger state machine, mirrors the Pine script exactly -------
         if long_bias:
@@ -240,11 +260,11 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             self.short_bias_active = False
             self.short_fired = False
 
-        red_candle = bar.Close < bar.Open
-        green_candle = bar.Close > bar.Open
+        red_candle = bar.close < bar.open
+        green_candle = bar.close > bar.open
 
-        long_signal = long_bias and red_candle and bar.Close > vwap_value and not self.long_fired
-        short_signal = short_bias and green_candle and bar.Close < vwap_value and not self.short_fired
+        long_signal = long_bias and red_candle and bar.close > vwap_value and not self.long_fired
+        short_signal = short_bias and green_candle and bar.close < vwap_value and not self.short_fired
 
         if long_signal:
             self.long_fired = True
@@ -252,7 +272,7 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             self.short_fired = True
 
         # --- session / limit filters --------------------------------------
-        minutes_of_day = self.Time.hour * 60 + self.Time.minute
+        minutes_of_day = self.time.hour * 60 + self.time.minute
         in_blocked_window = self.blocked_start_min <= minutes_of_day < self.blocked_end_min
         past_no_new_trades = minutes_of_day >= self.no_new_trades_min
         past_flatten_time = minutes_of_day >= self.flatten_min
@@ -282,15 +302,15 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         return dt.date()
 
     def _update_vwap(self, bar: TradeBar):
-        session_date = self._session_date_for(bar.Time)
+        session_date = self._session_date_for(bar.time)
         if session_date != self.current_session_date:
             self.current_session_date = session_date
             self.cum_pv = 0.0
             self.cum_vol = 0.0
 
-        typical_price = (bar.High + bar.Low + bar.Close) / 3.0
-        self.cum_pv += typical_price * bar.Volume
-        self.cum_vol += bar.Volume
+        typical_price = (bar.high + bar.low + bar.close) / 3.0
+        self.cum_pv += typical_price * bar.volume
+        self.cum_vol += bar.volume
 
     def _current_vwap(self):
         if self.cum_vol <= 0:
@@ -300,30 +320,30 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
     def _update_windows(self, bar: TradeBar):
         vwap_value = self._current_vwap()
         if vwap_value is not None:
-            self.vwap_window.Add(vwap_value)
-        self.close_window.Add(float(bar.Close))
+            self.vwap_window.add(vwap_value)
+        self.close_window.add(float(bar.close))
 
     # ----------------------------------------------------------------------
     # Order management
     # ----------------------------------------------------------------------
     def _submit_entry(self, direction: int):
         quantity = direction * self.order_size
-        self.entry_ticket = self.MarketOrder(self.symbol, quantity)
+        self.entry_ticket = self.market_order(self.symbol, quantity)
         self.pending_direction = direction
         self.in_position = True
         self.trades_today += 1
 
-    def OnOrderEvent(self, orderEvent):
-        if orderEvent.Status != OrderStatus.Filled:
+    def on_order_event(self, order_event: OrderEvent):
+        if order_event.status != OrderStatus.FILLED:
             return
 
-        if self.entry_ticket is not None and orderEvent.OrderId == self.entry_ticket.OrderId:
-            self._on_entry_filled(orderEvent.FillPrice)
+        if self.entry_ticket is not None and order_event.order_id == self.entry_ticket.order_id:
+            self._on_entry_filled(order_event.fill_price)
             return
 
-        exit_ids = {t.OrderId for t in self.exit_tickets}
-        if orderEvent.OrderId in exit_ids:
-            self._on_exit_filled(orderEvent.FillPrice)
+        exit_ids = {t.order_id for t in self.exit_tickets}
+        if order_event.order_id in exit_ids:
+            self._on_exit_filled(order_event.fill_price)
 
     def _on_entry_filled(self, fill_price: float):
         self.entry_price = fill_price
@@ -338,8 +358,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
             stop_price = self.entry_price + self.short_stop_points
             target_price = self.entry_price - self.short_target_points
 
-        stop_ticket = self.StopMarketOrder(self.symbol, exit_quantity, stop_price)
-        target_ticket = self.LimitOrder(self.symbol, exit_quantity, target_price)
+        stop_ticket = self.stop_market_order(self.symbol, exit_quantity, stop_price)
+        target_ticket = self.limit_order(self.symbol, exit_quantity, target_price)
         self.exit_tickets = [stop_ticket, target_ticket]
 
     def _on_exit_filled(self, fill_price: float):
@@ -349,8 +369,8 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
                 self.losses_today += 1
 
         for ticket in self.exit_tickets:
-            if ticket.Status not in (OrderStatus.Filled, OrderStatus.Canceled, OrderStatus.Invalid):
-                ticket.Cancel()
+            if ticket.status not in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.INVALID):
+                ticket.cancel()
 
         self._reset_position_state()
 
