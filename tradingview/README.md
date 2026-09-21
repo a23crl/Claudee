@@ -111,12 +111,31 @@ There's no Python counterpart for this one; it's Pine-only.
    - **Entry Rules**: close-beyond-range vs. wick-beyond-range
      confirmation, breakout volume filter, one-trade-per-side-per-day cap,
      and whether shorts are allowed.
-   - **Risk Management**: stop buffer beyond the range, a fixed target as a
-     multiple of range width, or an ATR trailing stop instead; risk-per-trade
-     and max exposure as a % of equity.
+   - **Risk Management**: stop placement (breakout level vs. opposite range
+     side — see below), stop buffer, a fixed target as a multiple of range
+     width, or an ATR trailing stop instead; risk-per-trade and max exposure
+     as a % of equity.
    - **Session & Filters**: optional backtest date range.
 
 ## Notes
+
+- **Stop placement matters a lot here.** `Breakout level (tight)` (the
+  default) stops just beyond the range boundary that was broken — if price
+  falls back through it, the breakout failed. `Opposite range side (wide)`
+  stops at the far side of the whole range, so initial risk ≈ the entire
+  range width. The wide mode pairs a ~1R risk with a ~1R target
+  (`targetRangeMult` default 1.0), which needs a >50% win rate to be
+  profitable — a bad fit for a breakout strategy's naturally low win rate.
+  The tight mode shrinks risk so the same target is a much bigger
+  R-multiple, at the cost of more whipsaw stop-outs on noisy breaks. Test
+  both; neither is free.
+- **Don't trust a handful of trades.** A 30-min opening range firing at
+  most once per side per day produces very few signals — expect well under
+  50 trades a year even before the entry-window and range-size filters
+  narrow it further. A profit factor or win rate computed from under ~30-50
+  trades is mostly noise; see the top-level README's "Deciding if it's
+  worth going live" checklist before reading anything into a small-sample
+  result, win or lose.
 
 - **Volume filter**: on for a reason — breakout volume confirmation cuts
   down on false breaks — but disable it (`Require breakout volume

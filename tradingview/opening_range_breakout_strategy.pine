@@ -68,6 +68,7 @@ volMult             = input.float(1.0, "Min breakout volume (x time-of-day avera
 oneTradePerSidePerDay = input.bool(true, "Max one trade per direction per day", group = "Entry Rules")
 allowShort          = input.bool(true, "Allow short trades", group = "Entry Rules")
 
+stopMode             = input.string("Breakout level (tight)", "Stop placement", options = ["Breakout level (tight)", "Opposite range side (wide)"], group = "Risk Management", tooltip = "Breakout level: stop just beyond the range boundary that was broken -- if price falls back through it, the breakout failed. Opposite range side: stop at the far side of the whole range, so initial risk ~= the entire range width. Tight gives a much better reward:risk against the same target, at the cost of more whipsaw stop-outs on noisy breaks.")
 stopBufferAtr        = input.float(0.10, "Stop buffer beyond range (ATR)", minval = 0.0, step = 0.05, group = "Risk Management")
 targetRangeMult      = input.float(1.0, "Target distance (x range width)", minval = 0.1, step = 0.1, group = "Risk Management", tooltip = "Take-profit distance beyond the breakout point, expressed as a multiple of the opening range's width. Ignored if the ATR trailing stop is enabled.")
 useAtrTrailingStop   = input.bool(false, "Use ATR trailing stop instead of fixed target", group = "Risk Management")
@@ -177,7 +178,7 @@ canEnter = strategy.position_size == 0 and not session.islastbar
 // Nasdaq (MNQ) and 5 for Micro E-mini S&P (MES) -- skipping it would size
 // futures positions at the wrong multiple of the intended risk.
 if longSignal and canEnter
-    stopCalc = orLow - stopBufferAtr * atrVal
+    stopCalc = stopMode == "Breakout level (tight)" ? orHigh - stopBufferAtr * atrVal : orLow - stopBufferAtr * atrVal
     riskPerShare = close - stopCalc
     if riskPerShare > 0
         dollarRiskPerContract = riskPerShare * syminfo.pointvalue
@@ -189,7 +190,7 @@ if longSignal and canEnter
             strategy.entry("Long", strategy.long, qty = qty)
 
 if shortSignal and canEnter
-    stopCalcS = orHigh + stopBufferAtr * atrVal
+    stopCalcS = stopMode == "Breakout level (tight)" ? orLow + stopBufferAtr * atrVal : orHigh + stopBufferAtr * atrVal
     riskPerShareS = stopCalcS - close
     if riskPerShareS > 0
         dollarRiskPerContractS = riskPerShareS * syminfo.pointvalue
