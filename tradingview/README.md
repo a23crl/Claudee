@@ -96,9 +96,9 @@ There's no Python counterpart for this one; it's Pine-only.
 ## Setup
 
 1. Open a TradingView chart on an **intraday interval whose length divides
-   evenly into both the opening-range window and the entry window** (e.g.
-   1m/5m/15m for a 15-minute opening range) for a liquid symbol with real
-   volume.
+   evenly into both the opening-range window and the entry window** for a
+   liquid symbol with real volume. Defaults are a 30-minute opening range
+   (0930-1000 ET), so 1/2/3/5/6/10/15/30m charts all work.
 2. Pine Editor → New blank strategy → paste in
    `opening_range_breakout_strategy.pine` → Add to chart.
 3. Open **Strategy Tester → Properties** and set realistic commission and
