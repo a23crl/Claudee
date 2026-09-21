@@ -78,3 +78,80 @@ script does not place real orders by itself. To act on signals:
 Either way, paper trade the live signal path for a meaningful stretch
 before risking capital — a Pine backtest, like the Python one, can't fully
 capture real execution friction (latency, partial fills, data gaps).
+
+# Opening Range Breakout — TradingView (Pine Script v5)
+
+`opening_range_breakout_strategy.pine` is a from-scratch Pine implementation
+of the classic ORB concept (Toby Crabel / Mark Fisher, and the version
+popularized more recently by vendors like LuxAlgo): mark the high/low made
+during a configurable opening window each day, then trade confirmed breaks
+of that range with a stop on the opposite side and a target sized to the
+range's width (or an optional ATR trailing stop). It's an original build of
+the publicly-documented mechanics — not a copy of any vendor's proprietary
+source — written to match this repo's Pine conventions (risk-based position
+sizing, session-end flatten, data-coverage table, alerts).
+
+There's no Python counterpart for this one; it's Pine-only.
+
+## Setup
+
+1. Open a TradingView chart on an **intraday interval whose length divides
+   evenly into both the opening-range window and the entry window** for a
+   liquid symbol with real volume. Defaults are a 30-minute opening range
+   (0930-1000 ET), so 1/2/3/5/6/10/15/30m charts all work.
+2. Pine Editor → New blank strategy → paste in
+   `opening_range_breakout_strategy.pine` → Add to chart.
+3. Open **Strategy Tester → Properties** and set realistic commission and
+   slippage for your instrument/broker.
+4. Tune the inputs, grouped as:
+   - **Session & Range**: the opening-range window and timezone, the
+     allowed entry window, and min/max range size filters (in ATR
+     multiples) to skip days where the range is too tight or already blown
+     out.
+   - **Entry Rules**: close-beyond-range vs. wick-beyond-range
+     confirmation, breakout volume filter, one-trade-per-side-per-day cap,
+     and whether shorts are allowed.
+   - **Risk Management**: stop placement (breakout level vs. opposite range
+     side — see below), stop buffer, a fixed target as a multiple of range
+     width, or an ATR trailing stop instead; risk-per-trade and max exposure
+     as a % of equity.
+   - **Session & Filters**: optional backtest date range.
+
+## Notes
+
+- **Stop placement matters a lot here.** `Breakout level (tight)` (the
+  default) stops just beyond the range boundary that was broken — if price
+  falls back through it, the breakout failed. `Opposite range side (wide)`
+  stops at the far side of the whole range, so initial risk ≈ the entire
+  range width. The wide mode pairs a ~1R risk with a ~1R target
+  (`targetRangeMult` default 1.0), which needs a >50% win rate to be
+  profitable — a bad fit for a breakout strategy's naturally low win rate.
+  The tight mode shrinks risk so the same target is a much bigger
+  R-multiple, at the cost of more whipsaw stop-outs on noisy breaks. Test
+  both; neither is free.
+- **Don't trust a handful of trades.** A 30-min opening range firing at
+  most once per side per day produces very few signals — expect well under
+  50 trades a year even before the entry-window and range-size filters
+  narrow it further. A profit factor or win rate computed from under ~30-50
+  trades is mostly noise; see the top-level README's "Deciding if it's
+  worth going live" checklist before reading anything into a small-sample
+  result, win or lose.
+
+- **Volume filter**: on for a reason — breakout volume confirmation cuts
+  down on false breaks — but disable it (`Require breakout volume
+  confirmation`) for symbols without reliable volume data (spot FX). It's
+  time-of-day-matched relative volume, not a flat trailing average: each
+  breakout bar's volume is compared to an EMA of volume in that same
+  wall-clock minute on prior days, so a 10:00am bar is judged against other
+  10:00am bars, not lumped in with quieter midday bars.
+- **Timezone**: the opening-range and entry-window inputs are matched
+  against wall-clock time via `time(timeframe.period, session, timezone)`;
+  make sure the timezone string matches the session you actually mean
+  (e.g. `America/New_York` for the U.S. cash open), not the chart's display
+  timezone.
+- Same plan-bar-limit caveat as the VWAP script above — check the
+  data-coverage table before trusting a backtest's trade count.
+- Same execution-model caveats as the VWAP script (entry fills, sizing off
+  signal-bar close, session-end flatten via `session.islastbar`,
+  commission/slippage in Properties, stop-vs-target-in-same-bar ambiguity)
+  apply here too.

@@ -1,0 +1,282 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0.
+//
+// Opening Range Breakout (Intraday) — an original Pine Script v5
+// implementation of the classic ORB concept (Toby Crabel / Mark Fisher):
+// mark the high/low made during a configurable opening window, then trade
+// confirmed breaks of that range with a stop on the opposite side and a
+// target sized to the range's width. This is NOT a copy of any vendor's
+// (e.g. LuxAlgo) proprietary source -- it's a from-scratch build of the
+// publicly-documented mechanics, written to match this repo's conventions.
+//
+// Not proven profitable. Treat it as a starting point for your own testing
+// in the Strategy Tester (in-sample/out-of-sample split, multiple symbols,
+// realistic commission/slippage in Properties) -- not a signal to trade as-is.
+//
+// Only meaningful on INTRADAY charts. The opening-range window and entry
+// window are matched against wall-clock time via time(timeframe.period,
+// session, timezone), which requires the chart's timeframe to evenly divide
+// the session boundaries -- daily+ bars will never populate a range. Default
+// inputs below assume a 30-minute opening range (0930-1000 ET), so any chart
+// timeframe that divides evenly into 30 minutes works: 1, 2, 3, 5, 6, 10,
+// 15, or 30m. (A straight 30m chart works too -- the range then equals the
+// single bar spanning the window, which is fine but gives no intra-range
+// detail.) Change orSession/entrySession below to match whatever window you
+// actually trade, and pick a chart timeframe that divides evenly into it.
+//
+// TradingView plan bar limit: lower tiers cap total historical bars a chart
+// can load (as low as 10,000). That cap is on BAR COUNT, not calendar time,
+// so it bites hardest on small timeframes:
+//   1m  @ 10,000 bars ~= 25 trading days   (~1 month)  -- too small a sample
+//   5m  @ 10,000 bars ~= 128 trading days  (~6 months)
+//   15m @ 10,000 bars ~= 385 trading days  (~1.5 years)
+//   30m @ 10,000 bars ~= 770 trading days  (~3 years)
+// The table drawn in the chart's top-right corner reports the actual bar
+// count and date range you got, so you don't have to guess.
+//@version=5
+strategy(
+     "Opening Range Breakout (Intraday)",
+     shorttitle           = "ORB",
+     overlay              = true,
+     initial_capital      = 100000,
+     currency             = currency.USD,
+     default_qty_type     = strategy.cash,
+     default_qty_value    = 100000,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.01,   // ~1 bps round-turn approximation; set your real costs in Properties.
+                                     // For FUTURES, percent-of-notional is the wrong model -- your broker
+                                     // charges a flat $ per contract per side. Switch commission_type to
+                                     // strategy.commission.cash_per_contract and commission_value to that
+                                     // $ amount in Properties -> Commission (or here).
+     slippage             = 2,      // in ticks; adjust for your instrument in Properties
+     pyramiding           = 0,
+     calc_on_every_tick   = false)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+orSession        = input.session("0930-1000", "Opening range window", group = "Session & Range", tooltip = "Wall-clock window (in the timezone below) whose high/low defines the opening range. Must line up with the chart's timeframe -- e.g. this 30-min default needs a chart timeframe that divides evenly into 30 minutes (1, 2, 3, 5, 6, 10, 15, 30m).")
+sessionTz        = input.string("America/New_York", "Timezone", group = "Session & Range", tooltip = "IANA timezone string for both the opening-range window and the entry window below, e.g. America/New_York, Europe/London, Asia/Tokyo.")
+entrySession     = input.session("1000-1600", "Allowed entry window", group = "Session & Range", tooltip = "Breakout signals outside this window are ignored. Should start when the opening range window ends.")
+atrPeriod        = input.int(14, "ATR period", minval = 1, group = "Session & Range")
+minRangeAtrMult  = input.float(0.10, "Min range size (x ATR)", minval = 0.0, step = 0.05, group = "Session & Range", tooltip = "Skip the day if the opening range is smaller than this multiple of ATR -- too tight to trade cleanly.")
+maxRangeAtrMult  = input.float(3.0, "Max range size (x ATR)", minval = 0.1, step = 0.1, group = "Session & Range", tooltip = "Skip the day if the opening range is larger than this multiple of ATR -- price already trended hard before the window closed.")
+
+requireCloseBeyond = input.bool(true, "Require candle close beyond range (not just a wick)", group = "Entry Rules")
+useVolumeFilter     = input.bool(true, "Require breakout volume confirmation", group = "Entry Rules")
+volTimeOfDayLookbackDays = input.int(20, "Volume avg lookback (days, time-of-day matched)", minval = 2, group = "Entry Rules", tooltip = "Compares the breakout bar's volume to an EMA-smoothed average of volume in this same wall-clock minute on prior days (~N-day lookback) -- accounts for the open/midday/close intraday volume curve, instead of a flat trailing-bar average that mixes different times of day.")
+volMult             = input.float(1.0, "Min breakout volume (x time-of-day average)", minval = 0.1, step = 0.1, group = "Entry Rules")
+oneTradePerSidePerDay = input.bool(true, "Max one trade per direction per day", group = "Entry Rules")
+allowShort          = input.bool(true, "Allow short trades", group = "Entry Rules")
+
+stopMode             = input.string("Breakout level (tight)", "Stop placement", options = ["Breakout level (tight)", "Opposite range side (wide)"], group = "Risk Management", tooltip = "Breakout level: stop just beyond the range boundary that was broken -- if price falls back through it, the breakout failed. Opposite range side: stop at the far side of the whole range, so initial risk ~= the entire range width. Tight gives a much better reward:risk against the same target, at the cost of more whipsaw stop-outs on noisy breaks.")
+stopBufferAtr        = input.float(0.10, "Stop buffer beyond range (ATR)", minval = 0.0, step = 0.05, group = "Risk Management")
+targetRangeMult      = input.float(1.0, "Target distance (x range width)", minval = 0.1, step = 0.1, group = "Risk Management", tooltip = "Take-profit distance beyond the breakout point, expressed as a multiple of the opening range's width. Ignored if the ATR trailing stop is enabled.")
+useAtrTrailingStop   = input.bool(false, "Use ATR trailing stop instead of fixed target", group = "Risk Management")
+trailAtrMult         = input.float(2.0, "Trailing stop distance (x ATR)", minval = 0.1, step = 0.1, group = "Risk Management")
+riskPct              = input.float(0.75, "Risk per trade (% of equity)", minval = 0.01, step = 0.05, group = "Risk Management") / 100.0
+maxGrossExposurePct  = input.float(100.0, "Max notional exposure (% of equity)", minval = 1.0, step = 5.0, group = "Risk Management") / 100.0
+
+useDateFilter = input.bool(false, "Limit to date range", group = "Session & Filters")
+// NOTE: the multi-arg timestamp(year, month, day, ...) form resolves to
+// "simple int" and input.time() requires a "const int" default -- use the
+// single-string form of timestamp(), which Pine folds to a true constant.
+startDate     = input.time(timestamp("2023-01-01T00:00:00"), "Start", group = "Session & Filters")
+endDate       = input.time(timestamp("2025-01-01T00:00:00"), "End", group = "Session & Filters")
+
+minAtrValue = 1e-6
+
+// ---------------------------------------------------------------------------
+// Opening range tracking -- resets every calendar day, accumulates high/low
+// while the bar falls inside orSession, freezes once that window ends.
+// ---------------------------------------------------------------------------
+newDay = ta.change(time("D")) != 0
+
+var float orHigh      = na
+var float orLow       = na
+var float orWidth     = na
+var bool  orDone       = false
+var bool  rangeSizeOk  = false
+var bool  longTaken    = false
+var bool  shortTaken   = false
+
+if newDay
+    orHigh     := na
+    orLow      := na
+    orWidth    := na
+    orDone     := false
+    rangeSizeOk := false
+    longTaken   := false
+    shortTaken  := false
+
+inRange = not na(time(timeframe.period, orSession, sessionTz))
+inEntryWindow = not na(time(timeframe.period, entrySession, sessionTz))
+
+if inRange
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow) ? low : math.min(orLow, low)
+
+atrVal = math.max(ta.atr(atrPeriod), minAtrValue)
+
+rangeJustEnded = not inRange and inRange[1] and not na(orHigh)
+if rangeJustEnded
+    orDone     := true
+    orWidth    := orHigh - orLow
+    rangeSizeOk := orWidth >= minRangeAtrMult * atrVal and orWidth <= maxRangeAtrMult * atrVal
+
+inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+// ---------------------------------------------------------------------------
+// Breakout signals -- a confirmed cross of the range boundary, at most once
+// per side per day, gated by the entry window, range-size sanity check, and
+// (optionally) breakout volume.
+// ---------------------------------------------------------------------------
+// Time-of-day matched relative volume -- an EMA-smoothed average volume per
+// wall-clock minute (in sessionTz), built up across days, so a breakout
+// bar's volume is judged against what's normal for THAT time of day (open
+// vs. midday vs. close volume curve) rather than a flat trailing-bar
+// average that mixes bars from different parts of the day. hour()/minute()
+// resolve DST automatically for sessionTz, so the slot stays aligned to the
+// same wall-clock time year-round.
+var float[] volByMinuteOfDay = array.new_float(1440, na)
+minuteOfDay    = hour(time, sessionTz) * 60 + minute(time, sessionTz)
+emaAlpha       = 2.0 / (volTimeOfDayLookbackDays + 1.0)
+priorAvgAtSlot = array.get(volByMinuteOfDay, minuteOfDay)
+avgVolAtTime   = na(priorAvgAtSlot) ? volume : priorAvgAtSlot
+volOk = not useVolumeFilter or volume >= volMult * avgVolAtTime
+// Update AFTER computing volOk so a bar's own volume never biases the
+// comparison it's being judged against.
+array.set(volByMinuteOfDay, minuteOfDay, na(priorAvgAtSlot) ? volume : priorAvgAtSlot + emaAlpha * (volume - priorAvgAtSlot))
+
+breakoutUpSeries   = requireCloseBeyond ? close : high
+breakoutDownSeries = requireCloseBeyond ? close : low
+
+rawLongBreak  = orDone and rangeSizeOk and ta.crossover(breakoutUpSeries, orHigh)
+rawShortBreak = orDone and rangeSizeOk and ta.crossunder(breakoutDownSeries, orLow)
+
+longSignal  = rawLongBreak and volOk and inEntryWindow and inDateRange and (not oneTradePerSidePerDay or not longTaken)
+shortSignal = rawShortBreak and volOk and inEntryWindow and inDateRange and allowShort and (not oneTradePerSidePerDay or not shortTaken)
+
+if longSignal
+    longTaken := true
+if shortSignal
+    shortTaken := true
+
+// ---------------------------------------------------------------------------
+// Entries -- a signal on this bar's close fills at the NEXT bar's open
+// (Pine's default market-order timing, no extra code needed). Position size
+// targets riskPct of equity lost at the stop, capped by maxGrossExposurePct
+// of notional; sized off this bar's close as a lookahead-free proxy for the
+// (unknown) next-bar fill price.
+// ---------------------------------------------------------------------------
+var float pendingStop  = na
+var float pendingWidth = na
+
+canEnter = strategy.position_size == 0 and not session.islastbar
+
+// syminfo.pointvalue converts a price-point move into dollars per contract.
+// It's 1 for stocks/ETFs (1 point == $1), but e.g. 2 for Micro E-mini
+// Nasdaq (MNQ) and 5 for Micro E-mini S&P (MES) -- skipping it would size
+// futures positions at the wrong multiple of the intended risk.
+if longSignal and canEnter
+    stopCalc = stopMode == "Breakout level (tight)" ? orHigh - stopBufferAtr * atrVal : orLow - stopBufferAtr * atrVal
+    riskPerShare = close - stopCalc
+    if riskPerShare > 0
+        dollarRiskPerContract = riskPerShare * syminfo.pointvalue
+        notionalPerContract   = close * syminfo.pointvalue
+        qty = math.floor(math.min(riskPct * strategy.equity / dollarRiskPerContract, maxGrossExposurePct * strategy.equity / notionalPerContract))
+        if qty > 0
+            pendingStop  := stopCalc
+            pendingWidth := orWidth
+            strategy.entry("Long", strategy.long, qty = qty)
+
+if shortSignal and canEnter
+    stopCalcS = stopMode == "Breakout level (tight)" ? orLow + stopBufferAtr * atrVal : orHigh + stopBufferAtr * atrVal
+    riskPerShareS = stopCalcS - close
+    if riskPerShareS > 0
+        dollarRiskPerContractS = riskPerShareS * syminfo.pointvalue
+        notionalPerContractS   = close * syminfo.pointvalue
+        qtyS = math.floor(math.min(riskPct * strategy.equity / dollarRiskPerContractS, maxGrossExposurePct * strategy.equity / notionalPerContractS))
+        if qtyS > 0
+            pendingStop  := stopCalcS
+            pendingWidth := orWidth
+            strategy.entry("Short", strategy.short, qty = qtyS)
+
+// ---------------------------------------------------------------------------
+// Exits -- fixed stop on the opposite side of the range (plus ATR buffer)
+// and either a fixed target (targetRangeMult x range width) or an ATR
+// trailing stop, plus a forced flatten at session end.
+// ---------------------------------------------------------------------------
+var float activeStop   = na
+var float activeTarget = na
+
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justFilled
+    entryPx      = strategy.position_avg_price
+    activeStop   := pendingStop
+    activeTarget := strategy.position_size > 0 ? entryPx + targetRangeMult * pendingWidth : entryPx - targetRangeMult * pendingWidth
+
+trailPoints = useAtrTrailingStop ? (trailAtrMult * atrVal) / syminfo.mintick : na
+trailOffset = useAtrTrailingStop ? (stopBufferAtr * atrVal) / syminfo.mintick : na
+
+if session.islastbar and strategy.position_size != 0
+    strategy.close_all(comment = "session_end")
+    activeStop   := na
+    activeTarget := na
+else
+    if strategy.position_size > 0
+        if useAtrTrailingStop
+            strategy.exit("Exit Long", from_entry = "Long", stop = activeStop, trail_points = trailPoints, trail_offset = trailOffset)
+        else
+            strategy.exit("Exit Long", from_entry = "Long", stop = activeStop, limit = activeTarget)
+    if strategy.position_size < 0
+        if useAtrTrailingStop
+            strategy.exit("Exit Short", from_entry = "Short", stop = activeStop, trail_points = trailPoints, trail_offset = trailOffset)
+        else
+            strategy.exit("Exit Short", from_entry = "Short", stop = activeStop, limit = activeTarget)
+
+if strategy.position_size == 0
+    activeStop   := na
+    activeTarget := na
+    pendingStop  := na
+    pendingWidth := na
+
+// ---------------------------------------------------------------------------
+// Data-coverage diagnostic -- reports how many bars/how much calendar time
+// TradingView actually loaded on this chart/timeframe, since lower plan
+// tiers cap total historical bars.
+// ---------------------------------------------------------------------------
+var int firstBarTime = na
+if bar_index == 0
+    firstBarTime := time
+
+var table infoTable = table.new(position.top_right, 2, 3, border_width = 1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Bars on chart", bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 1, 0, str.tostring(bar_index + 1), bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Chart range", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 1, str.format_time(firstBarTime, "yyyy-MM-dd") + " to " + str.format_time(time, "yyyy-MM-dd"), bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 0, 2, "Closed trades", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 2, str.tostring(strategy.closedtrades), bgcolor = color.new(color.gray, 70), text_color = color.white)
+
+// ---------------------------------------------------------------------------
+// Visuals
+// ---------------------------------------------------------------------------
+bgcolor(inRange ? color.new(color.blue, 88) : na, title = "Opening range window")
+
+plot(orDone and rangeSizeOk ? orHigh : na, title = "Opening Range High", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 1)
+plot(orDone and rangeSizeOk ? orLow : na, title = "Opening Range Low", color = color.new(color.maroon, 0), style = plot.style_linebr, linewidth = 1)
+
+plotshape(longSignal, title = "Long Breakout", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny)
+plotshape(shortSignal, title = "Short Breakout", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny)
+
+plot(strategy.position_size != 0 ? activeStop : na, title = "Stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size != 0 and not useAtrTrailingStop ? activeTarget : na, title = "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+
+// ---------------------------------------------------------------------------
+// Alerts -- for paper/live use via TradingView alerts -> webhook to your own
+// execution bridge or supported broker integration. TradingView itself does
+// not place trades from a Pine strategy; the Strategy Tester is simulation
+// only. See tradingview/README.md.
+// ---------------------------------------------------------------------------
+alertcondition(longSignal, title = "ORB Long", message = "Opening Range Breakout LONG: {{ticker}} @ {{close}}")
+alertcondition(shortSignal, title = "ORB Short", message = "Opening Range Breakout SHORT: {{ticker}} @ {{close}}")
