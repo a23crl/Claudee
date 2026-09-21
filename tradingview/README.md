@@ -115,6 +115,22 @@ script does not place real orders by itself. To act on signals:
   integrates with can execute strategy alerts directly — check your
   broker's TradingView integration docs.
 
+`nq_vwap_momentum_strategy.pine` specifically exposes two alert flows,
+described in its own header comment and just above its `alertcondition()`
+calls:
+
+1. **Named conditions** (Condition = one of "NQ VWAP Momentum Long/Short/Flatten"
+   in TradingView's Create Alert dialog) — plain-text notifications for
+   manual or semi-automated use (you get pinged, you place the order).
+2. **`alert()` calls** (Condition = the script's name, trigger = "Any alert()
+   function call") — dynamic JSON payloads (`{"action":"enter_long",...}`,
+   `enter_short`, `flatten_all`) with quantity and stop/target points
+   embedded, for a webhook bridge to act on directly. Both flows only fire
+   when a trade is actually allowed (past the session windows and the
+   daily trade/loss caps) — an earlier version of this script alerted on
+   the raw pattern instead, which would have notified/traded through those
+   limits.
+
 Either way, paper trade the live signal path for a meaningful stretch
 before risking capital — a Pine backtest, like the Python one, can't fully
 capture real execution friction (latency, partial fills, data gaps).

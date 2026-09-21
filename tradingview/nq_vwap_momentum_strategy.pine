@@ -36,6 +36,17 @@
 // commission/slippage for your contract before considering live use — see
 // the top-level README's "Deciding if it's worth going live" checklist,
 // which applies here just as much as to the other script in this repo.
+//
+// Alerts for automation: this script fires alert() calls with a JSON
+// payload (see the bottom of the file) for three events -- enter_long,
+// enter_short, flatten_all -- suitable for a webhook bridge to a broker.
+// To receive these, create a TradingView alert with Condition set to this
+// script's name and trigger set to "Any alert() function call" (not one of
+// the named conditions below, which are plain-text notifications for
+// manual/semi-automated use instead). Use "Once per bar close" so the
+// alert fires on a confirmed candle, matching how the strategy itself
+// evaluates signals -- not "Once per bar", which would fire intrabar
+// before the pattern is actually confirmed.
 //@version=5
 strategy(
      "NQ VWAP Momentum Pullback",
@@ -62,6 +73,7 @@ longStopPts         = input.float(80, "Long stop (points)", minval = 1, group = 
 longTargetPts       = input.float(40, "Long target (points)", minval = 1, group = "Risk Management")
 shortStopPts        = input.float(80, "Short stop (points)", minval = 1, group = "Risk Management")
 shortTargetPts      = input.float(50, "Short target (points)", minval = 1, group = "Risk Management")
+orderQty            = input.int(1, "Order size (contracts)", minval = 1, group = "Risk Management")
 
 maxTradesPerDay     = input.int(2, "Max trades per day", minval = 1, group = "Session & Limits")
 maxLossesPerDay     = input.int(2, "Max losses per day", minval = 1, group = "Session & Limits")
@@ -187,12 +199,15 @@ if strategy.closedtrades > prevClosedTrades
 // ---------------------------------------------------------------------------
 canEnter = strategy.position_size == 0 and not inBlockedWindow and not pastNoNewTrades and not pastFlattenTime and tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay
 
-if longSignal and canEnter
-    strategy.entry("Long", strategy.long)
+longEntry  = longSignal and canEnter
+shortEntry = shortSignal and canEnter
+
+if longEntry
+    strategy.entry("Long", strategy.long, qty = orderQty)
     tradesToday += 1
 
-if shortSignal and canEnter
-    strategy.entry("Short", strategy.short)
+if shortEntry
+    strategy.entry("Short", strategy.short, qty = orderQty)
     tradesToday += 1
 
 // ---------------------------------------------------------------------------
@@ -201,7 +216,11 @@ if shortSignal and canEnter
 strategy.exit("Exit Long", from_entry = "Long", profit = longTargetPts / syminfo.mintick, loss = longStopPts / syminfo.mintick)
 strategy.exit("Exit Short", from_entry = "Short", profit = shortTargetPts / syminfo.mintick, loss = shortStopPts / syminfo.mintick)
 
-// End-of-day flatten, independent of the exit orders above.
+// End-of-day flatten, independent of the exit orders above. Edge-triggered
+// (fires once, on the bar the cutoff is first reached) so the flatten_all
+// alert below fires once per day rather than on every bar past 16:55.
+flattenTimeReached = pastFlattenTime and not pastFlattenTime[1]
+
 if pastFlattenTime and strategy.position_size != 0
     strategy.close_all(comment = "eod_flatten")
 
@@ -229,6 +248,41 @@ if barstate.islast
 // ---------------------------------------------------------------------------
 // Alerts — TradingView Strategy Tester is simulation only; use these with
 // Alerts -> webhook to an execution bridge for paper/live use.
+//
+// Two independent sets, for two different alert-creation flows in
+// TradingView's "Create Alert" dialog:
+//
+// 1. Named conditions below (Condition = one of these three names) — plain
+//    text, for manual/semi-automated use (push notification, you place the
+//    order yourself). Fire only when the trade is actually allowed
+//    (longEntry/shortEntry, not the raw longSignal/shortSignal pattern) —
+//    an earlier version of this script alerted on the raw pattern, which
+//    would have notified through the blocked session windows and the
+//    daily trade/loss caps.
+//
+// 2. alert() calls further down (Condition = this script's name, trigger =
+//    "Any alert() function call") — dynamic JSON payloads for a webhook
+//    bridge to act on directly. Same gating as the named conditions, plus
+//    a dedicated flatten_all event for the 16:55 forced close, and the
+//    stop/target points and quantity embedded so the bridge can attach
+//    them as a bracket order at entry time instead of waiting on a second
+//    alert for the exit.
 // ---------------------------------------------------------------------------
-alertcondition(longSignal, title = "NQ VWAP Momentum Long", message = "NQ VWAP MOMENTUM LONG: {{ticker}} @ {{close}}")
-alertcondition(shortSignal, title = "NQ VWAP Momentum Short", message = "NQ VWAP MOMENTUM SHORT: {{ticker}} @ {{close}}")
+alertcondition(longEntry, title = "NQ VWAP Momentum Long", message = "NQ VWAP MOMENTUM LONG: {{ticker}} @ {{close}}")
+alertcondition(shortEntry, title = "NQ VWAP Momentum Short", message = "NQ VWAP MOMENTUM SHORT: {{ticker}} @ {{close}}")
+alertcondition(flattenTimeReached, title = "NQ VWAP Momentum Flatten", message = "NQ VWAP MOMENTUM FLATTEN ALL: {{ticker}} @ {{close}}")
+
+longAlertMsg = '{"action":"enter_long","symbol":"{{ticker}}","qty":' + str.tostring(orderQty) +
+     ',"stop_points":' + str.tostring(longStopPts) + ',"target_points":' + str.tostring(longTargetPts) +
+     ',"price":{{close}},"time":"{{time}}"}'
+shortAlertMsg = '{"action":"enter_short","symbol":"{{ticker}}","qty":' + str.tostring(orderQty) +
+     ',"stop_points":' + str.tostring(shortStopPts) + ',"target_points":' + str.tostring(shortTargetPts) +
+     ',"price":{{close}},"time":"{{time}}"}'
+flattenAlertMsg = '{"action":"flatten_all","symbol":"{{ticker}}","time":"{{time}}"}'
+
+if longEntry
+    alert(longAlertMsg, alert.freq_once_per_bar)
+if shortEntry
+    alert(shortAlertMsg, alert.freq_once_per_bar)
+if flattenTimeReached
+    alert(flattenAlertMsg, alert.freq_once_per_bar)
