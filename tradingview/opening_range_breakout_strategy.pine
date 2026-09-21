@@ -63,8 +63,8 @@ maxRangeAtrMult  = input.float(3.0, "Max range size (x ATR)", minval = 0.1, step
 
 requireCloseBeyond = input.bool(true, "Require candle close beyond range (not just a wick)", group = "Entry Rules")
 useVolumeFilter     = input.bool(true, "Require breakout volume confirmation", group = "Entry Rules")
-volLen              = input.int(20, "Volume average length", minval = 1, group = "Entry Rules")
-volMult             = input.float(1.0, "Min breakout volume (x average)", minval = 0.1, step = 0.1, group = "Entry Rules")
+volTimeOfDayLookbackDays = input.int(20, "Volume avg lookback (days, time-of-day matched)", minval = 2, group = "Entry Rules", tooltip = "Compares the breakout bar's volume to an EMA-smoothed average of volume in this same wall-clock minute on prior days (~N-day lookback) -- accounts for the open/midday/close intraday volume curve, instead of a flat trailing-bar average that mixes different times of day.")
+volMult             = input.float(1.0, "Min breakout volume (x time-of-day average)", minval = 0.1, step = 0.1, group = "Entry Rules")
 oneTradePerSidePerDay = input.bool(true, "Max one trade per direction per day", group = "Entry Rules")
 allowShort          = input.bool(true, "Allow short trades", group = "Entry Rules")
 
@@ -129,8 +129,22 @@ inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
 // per side per day, gated by the entry window, range-size sanity check, and
 // (optionally) breakout volume.
 // ---------------------------------------------------------------------------
-avgVol = ta.sma(volume, volLen)
-volOk  = not useVolumeFilter or volume >= volMult * avgVol
+// Time-of-day matched relative volume -- an EMA-smoothed average volume per
+// wall-clock minute (in sessionTz), built up across days, so a breakout
+// bar's volume is judged against what's normal for THAT time of day (open
+// vs. midday vs. close volume curve) rather than a flat trailing-bar
+// average that mixes bars from different parts of the day. hour()/minute()
+// resolve DST automatically for sessionTz, so the slot stays aligned to the
+// same wall-clock time year-round.
+var float[] volByMinuteOfDay = array.new_float(1440, na)
+minuteOfDay    = hour(time, sessionTz) * 60 + minute(time, sessionTz)
+emaAlpha       = 2.0 / (volTimeOfDayLookbackDays + 1.0)
+priorAvgAtSlot = array.get(volByMinuteOfDay, minuteOfDay)
+avgVolAtTime   = na(priorAvgAtSlot) ? volume : priorAvgAtSlot
+volOk = not useVolumeFilter or volume >= volMult * avgVolAtTime
+// Update AFTER computing volOk so a bar's own volume never biases the
+// comparison it's being judged against.
+array.set(volByMinuteOfDay, minuteOfDay, na(priorAvgAtSlot) ? volume : priorAvgAtSlot + emaAlpha * (volume - priorAvgAtSlot))
 
 breakoutUpSeries   = requireCloseBeyond ? close : high
 breakoutDownSeries = requireCloseBeyond ? close : low

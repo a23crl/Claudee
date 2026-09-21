@@ -120,7 +120,11 @@ There's no Python counterpart for this one; it's Pine-only.
 
 - **Volume filter**: on for a reason — breakout volume confirmation cuts
   down on false breaks — but disable it (`Require breakout volume
-  confirmation`) for symbols without reliable volume data (spot FX).
+  confirmation`) for symbols without reliable volume data (spot FX). It's
+  time-of-day-matched relative volume, not a flat trailing average: each
+  breakout bar's volume is compared to an EMA of volume in that same
+  wall-clock minute on prior days, so a 10:00am bar is judged against other
+  10:00am bars, not lumped in with quieter midday bars.
 - **Timezone**: the opening-range and entry-window inputs are matched
   against wall-clock time via `time(timeframe.period, session, timezone)`;
   make sure the timezone string matches the session you actually mean
