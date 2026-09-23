@@ -27,8 +27,12 @@ tied to the Python research project. Rules:
   bias turns on; the first green candle pulling back toward VWAP after a
   short bias turns on. Only the first qualifying candle of each bias episode
   fires.
-- **Session filters**: no new entries 09:30-10:30 America/New_York, no new
-  entries after 15:30, everything flattened at 16:55.
+- **Session filters**: entries only allowed 09:30-15:30 America/New_York —
+  no entries overnight or during Asian/London hours even though NQ trades
+  nearly 24h on Globex, since this setup's volatility assumption is tied to
+  US equity market hours — excluding a 09:30-10:30 no-trade window right
+  after the open, and no new entries after 15:30. Everything flattened at
+  16:55.
 - **Trade caps**: one open position at a time, max 2 entries/day, trading
   stops for the rest of the day after 2 losses.
 - **Exits**: fixed points, no trailing — long risks 80 points to make 40;

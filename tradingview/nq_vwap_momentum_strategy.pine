@@ -16,8 +16,13 @@
 //                 turns on. Only the first qualifying candle of each bias
 //                 episode fires — the state machine re-arms only once the
 //                 bias condition goes false and comes back true again.
-//   Session     : no new entries 09:30-10:30 America/New_York, no new
-//                 entries after 15:30, flatten everything at 16:55.
+//   Session     : entries only allowed 09:30-15:30 America/New_York (i.e.
+//                 within the US equity market session, which is where this
+//                 setup's volatility assumption holds -- no entries
+//                 overnight or during Asian/London hours even though NQ
+//                 trades nearly 24h), excluding a 09:30-10:30 no-trade
+//                 window right after the open, and no new entries after
+//                 15:30. Flatten everything at 16:55.
 //   Trade caps  : max 1 open position at a time, max 2 entries/day, and
 //                 trading stops for the day after 2 losing trades.
 //   Exits       : fixed points, no trailing —
@@ -85,6 +90,8 @@ noNewTradesHour     = input.int(15, "No new trades after hour (ET)", minval = 0,
 noNewTradesMinute   = input.int(30, "No new trades after minute (ET)", minval = 0, maxval = 59, group = "Session & Limits")
 flattenHour         = input.int(16, "Flatten all positions at hour (ET)", minval = 0, maxval = 23, group = "Session & Limits")
 flattenMinute       = input.int(55, "Flatten all positions at minute (ET)", minval = 0, maxval = 59, group = "Session & Limits")
+sessionOpenHour     = input.int(9, "No entries before hour (ET)", minval = 0, maxval = 23, group = "Session & Limits", tooltip = "Restricts entries to US equity market hours -- NQ trades ~24h on Globex, but overnight/Tokyo/London-hours volatility isn't what this setup is built around. No entries before this time, regardless of signal.")
+sessionOpenMinute   = input.int(30, "No entries before minute (ET)", minval = 0, maxval = 59, group = "Session & Limits")
 
 timezone = "America/New_York"
 
@@ -167,10 +174,12 @@ blockedStartMin = blockedStartHour * 60 + blockedStartMinute
 blockedEndMin   = blockedEndHour * 60 + blockedEndMinute
 noNewTradesMin  = noNewTradesHour * 60 + noNewTradesMinute
 flattenMin      = flattenHour * 60 + flattenMinute
+sessionOpenMin  = sessionOpenHour * 60 + sessionOpenMinute
 
-inBlockedWindow = nyMinutesOfDay >= blockedStartMin and nyMinutesOfDay < blockedEndMin
-pastNoNewTrades = nyMinutesOfDay >= noNewTradesMin
-pastFlattenTime = nyMinutesOfDay >= flattenMin
+inBlockedWindow   = nyMinutesOfDay >= blockedStartMin and nyMinutesOfDay < blockedEndMin
+beforeSessionOpen = nyMinutesOfDay < sessionOpenMin
+pastNoNewTrades   = nyMinutesOfDay >= noNewTradesMin
+pastFlattenTime   = nyMinutesOfDay >= flattenMin
 
 // ---------------------------------------------------------------------------
 // Daily trade / loss counters (reset each new NY calendar day)
@@ -197,7 +206,7 @@ if strategy.closedtrades > prevClosedTrades
 // Entries — one position at a time, capped trades/losses per day, no new
 // entries in the blocked window or after the daily cutoff.
 // ---------------------------------------------------------------------------
-canEnter = strategy.position_size == 0 and not inBlockedWindow and not pastNoNewTrades and not pastFlattenTime and tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay
+canEnter = strategy.position_size == 0 and not inBlockedWindow and not beforeSessionOpen and not pastNoNewTrades and not pastFlattenTime and tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay
 
 longEntry  = longSignal and canEnter
 shortEntry = shortSignal and canEnter
@@ -230,6 +239,7 @@ if pastFlattenTime and strategy.position_size != 0
 plot(vwapVal, title = "Session VWAP", color = color.new(color.blue, 0), linewidth = 2)
 bgcolor(longBiasActive ? color.new(color.green, 92) : shortBiasActive ? color.new(color.red, 92) : na, title = "Bias")
 bgcolor(inBlockedWindow ? color.new(color.orange, 85) : na, title = "No-Trade Window")
+bgcolor(beforeSessionOpen ? color.new(color.gray, 88) : na, title = "Outside NY Session")
 
 plotshape(longSignal, title = "Long Trigger", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.small)
 plotshape(shortSignal, title = "Short Trigger", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
