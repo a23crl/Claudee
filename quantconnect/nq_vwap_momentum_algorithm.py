@@ -19,8 +19,12 @@
 #                 toward VWAP) / the FIRST green candle after a short bias
 #                 turns on. Re-arms only once the bias condition goes false
 #                 and true again.
-#   Session     : no new entries 09:30-10:30 America/New_York, no new
-#                 entries after 15:30, flatten everything at 16:55.
+#   Session     : entries only allowed 09:30-15:30 America/New_York (US
+#                 equity market hours -- no entries overnight or during
+#                 Asian/London hours even though NQ trades ~24h on Globex),
+#                 excluding a 09:30-10:30 no-trade window right after the
+#                 open, and no new entries after 15:30. Flatten everything
+#                 at 16:55.
 #   Trade caps  : one open position at a time, max 2 entries/day, trading
 #                 stops for the day after 2 losing trades.
 #   Exits       : fixed points, no trailing -- long -80/+40, short -80/+50.
@@ -85,6 +89,11 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         self.blocked_end_min = 10 * 60 + 30     # 10:30 ET
         self.no_new_trades_min = 15 * 60 + 30   # 15:30 ET
         self.flatten_min = 16 * 60 + 55         # 16:55 ET
+        # No entries before this time -- restricts entries to US equity
+        # market hours. NQ trades ~24h on Globex, but this setup's
+        # volatility assumption is tied to the NY cash session, not
+        # overnight/Tokyo/London hours.
+        self.session_open_min = 9 * 60 + 30     # 09:30 ET
 
         self.order_size = 1  # contracts
 
@@ -280,12 +289,14 @@ class NQVWAPMomentumAlgorithm(QCAlgorithm):
         # --- session / limit filters --------------------------------------
         minutes_of_day = self.time.hour * 60 + self.time.minute
         in_blocked_window = self.blocked_start_min <= minutes_of_day < self.blocked_end_min
+        before_session_open = minutes_of_day < self.session_open_min
         past_no_new_trades = minutes_of_day >= self.no_new_trades_min
         past_flatten_time = minutes_of_day >= self.flatten_min
 
         can_enter = (
             not self.in_position
             and not in_blocked_window
+            and not before_session_open
             and not past_no_new_trades
             and not past_flatten_time
             and self.trades_today < self.max_trades_per_day
